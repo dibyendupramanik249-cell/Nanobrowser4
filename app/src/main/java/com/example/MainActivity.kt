@@ -36,9 +36,15 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Lock system bar colors to dark mode
+        window.statusBarColor = Color.parseColor("#121212")
+        window.navigationBarColor = Color.BLACK
+
+        // Root container with system window insets to clear status bar and gesture bar
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
+            fitsSystemWindows = true
         }
 
         urlBar = EditText(this).apply {
@@ -47,7 +53,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
             hint = "Search or type URL"
-            setBackgroundColor(Color.parseColor("#121212"))
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
             setPadding(28, 20, 28, 20)
             setOnEditorActionListener { _, actionId, event ->
                 if (actionId == EditorInfo.IME_ACTION_GO ||
@@ -149,16 +155,13 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                 val url = request?.url ?: return null
                 val host = url.host ?: ""
-                val path = url.path ?: ""
 
+                // Block ad and tracking scripts to prevent CPU drain and memory expansion
                 if (blockedDomains.any { host.contains(it) }) {
                     return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                 }
 
-                if (path.endsWith(".woff2") || path.endsWith(".ttf") || path.endsWith(".woff")) {
-                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
-                }
-
+                // Fonts are preserved so icon ligatures and typography render accurately
                 return super.shouldInterceptRequest(view, request)
             }
         }
