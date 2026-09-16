@@ -8,12 +8,13 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.engine.CustomChromeClient
@@ -30,21 +31,34 @@ fun BrowserScreen(
     val progress by viewModel.progress.collectAsState()
     val isDesktopMode by viewModel.isDesktopMode.collectAsState()
     val isDataSaver by viewModel.isDataSaver.collectAsState()
-    val purgeTrigger by viewModel.purgeTrigger.collectAsState()
-
-    val webView = remember(purgeTrigger) { mutableListOf<WebView>() }
+    
+    var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    var canGoBackState by remember { mutableStateOf(false) }
 
     Column(modifier = modifier.fillMaxSize()) {
         Omnibar(
             currentUrl = currentUrl,
             isDesktopMode = isDesktopMode,
             isDataSaver = isDataSaver,
-            onUrlSubmit = { viewModel.loadUrl(it) },
+            onUrlSubmit = { url ->
+                webViewInstance?.apply {
+                    stopLoading()
+                    loadUrl("about:blank")
+                    clearCache(false)
+                }
+                viewModel.loadUrl(url)
+            },
             onToggleDesktop = { viewModel.toggleDesktopMode() },
             onToggleDataSaver = { viewModel.toggleDataSaver() },
-            onGeminiHelp = { 
+            onGeminiHelp = {
+                webViewInstance?.apply {
+                    stopLoading()
+                    loadUrl("about:blank")
+                    clearHistory()
+                    clearCache(false)
+                }
                 System.gc()
-                viewModel.triggerPurgeAndLoad("https://dibyendupramanik.pythonanywhere.com") 
+                viewModel.loadUrl("https://dibyendupramanik.pythonanywhere.com")
             }
         )
 
@@ -63,30 +77,30 @@ fun BrowserScreen(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    
                     settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
-                        databaseEnabled = true
+                        databaseEnabled = false
                         setSupportZoom(true)
                         builtInZoomControls = true
                         displayZoomControls = false
                         cacheMode = WebSettings.LOAD_DEFAULT
                     }
-
                     webViewClient = CustomWebClient(
-                        onPageFinishedAction = { url -> 
+                        onPageFinishedAction = { url ->
+                            canGoBackState = this.canGoBack()
                             if (url != null && url != "about:blank") {
-                                viewModel.setUrlFromEngine(url) 
+                                viewModel.setUrlFromEngine(url)
                             }
                         }
                     )
-                    
                     webChromeClient = CustomChromeClient(
-                        onProgressChangedAction = { viewModel.updateProgress(it) }
+                        onProgressChangedAction = { p ->
+                            viewModel.updateProgress(p)
+                            canGoBackState = this.canGoBack()
+                        }
                     )
-                    
-                    webView.add(this)
+                    webViewInstance = this
                 }
             },
             update = { view ->
@@ -95,9 +109,8 @@ fun BrowserScreen(
                 val desktopUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
                 val mobileUa = WebSettings.getDefaultUserAgent(view.context)
                 view.settings.userAgentString = if (isDesktopMode) desktopUa else mobileUa
-
                 view.settings.blockNetworkImage = isDataSaver
-
+                
                 if (view.url != currentUrl && currentUrl != "about:blank") {
                     view.loadUrl(currentUrl)
                 }
@@ -107,11 +120,12 @@ fun BrowserScreen(
                 view.loadUrl("about:blank")
                 view.clearCache(false)
                 view.destroy()
+                webViewInstance = null
             }
         )
     }
 
-    BackHandler(enabled = webView.isNotEmpty() && webView[0].canGoBack()) {
-        webView[0].goBack()
+    BackHandler(enabled = canGoBackState) {
+        webViewInstance?.goBack()
     }
 }
