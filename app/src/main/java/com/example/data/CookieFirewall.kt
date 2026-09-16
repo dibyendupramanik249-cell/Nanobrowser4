@@ -1,12 +1,12 @@
 package com.example.data
 
 import android.webkit.CookieManager
+import android.webkit.WebView
 import android.util.Log
 
 object CookieFirewall {
     private val cookieManager = CookieManager.getInstance()
     private var isAuthMode = false
-
     private val authWhitelist = listOf(
         "accounts.google.com",
         "accounts.youtube.com",
@@ -18,7 +18,6 @@ object CookieFirewall {
 
     fun initialize() {
         cookieManager.setAcceptCookie(false)
-        cookieManager.setAcceptThirdPartyCookies(null, false)
         Log.d("CookieFirewall", "Cookie Firewall Initialized: Cookies Disabled")
     }
 
@@ -28,19 +27,15 @@ object CookieFirewall {
         return authWhitelist.any { lowerUrl.contains(it) }
     }
 
-    fun evaluateUrl(url: String?) {
-        if (isAuthRoute(url)) {
-            if (!isAuthMode) {
-                isAuthMode = true
-                cookieManager.setAcceptCookie(true)
-                Log.d("CookieFirewall", "Auth route detected. Cookies enabled for session.")
+    fun evaluateUrl(webView: WebView?, url: String?) {
+        val auth = isAuthRoute(url)
+        if (auth != isAuthMode) {
+            isAuthMode = auth
+            cookieManager.setAcceptCookie(auth)
+            webView?.let {
+                cookieManager.setAcceptThirdPartyCookies(it, auth)
             }
-        } else {
-            if (isAuthMode) {
-                isAuthMode = false
-                cookieManager.setAcceptCookie(false)
-                Log.d("CookieFirewall", "Standard route detected. Cookies disabled, session tokens preserved.")
-            }
+            Log.d("CookieFirewall", "Auth mode switched to $auth. Cookies updated.")
         }
     }
 }
