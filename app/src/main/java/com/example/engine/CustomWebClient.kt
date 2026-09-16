@@ -1,6 +1,8 @@
 package com.example.engine
 
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Log
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -30,6 +32,44 @@ class CustomWebClient(
             })();
         """.trimIndent()
         view?.evaluateJavascript(script, null)
+    }
+
+    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+        val url = request?.url?.toString() ?: return false
+        
+        // Let standard web protocols load inside WebView
+        if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("about:blank")) {
+            return false
+        }
+
+        // Handle Android intents (Google Lens, app deep links, play store redirects)
+        try {
+            val context = view?.context ?: return false
+            val intent = if (url.startsWith("intent:")) {
+                Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+            } else {
+                Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            }
+
+            if (intent != null) {
+                // Check if device has an app that can handle the intent
+                if (intent.resolveActivity(context.packageManager) != null) {
+                    context.startActivity(intent)
+                    return true
+                }
+                
+                // Fallback to browser URL if the app is missing
+                val fallbackUrl = intent.getStringExtra("browser_fallback_url")
+                if (!fallbackUrl.isNullOrEmpty()) {
+                    view.loadUrl(fallbackUrl)
+                    return true
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("CustomWebClient", "Failed to resolve custom scheme or intent: $url", e)
+        }
+
+        return true // Prevent ERR_UNKNOWN_URL_SCHEME crash
     }
 
     override fun shouldInterceptRequest(
