@@ -1,51 +1,41 @@
-package com.example.engine
+package com.example.data
 
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
+import android.webkit.CookieManager
 import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.graphics.Bitmap
 import android.util.Log
-import com.example.data.CookieFirewall
-import java.io.ByteArrayInputStream
 
-class CustomWebClient(
-    private val onPageFinishedAction: ((String?) -> Unit)? = null
-) : WebViewClient() {
+object CookieFirewall {
+    private val cookieManager = CookieManager.getInstance()
+    private var isAuthMode = false
+    private val authWhitelist = listOf(
+        "accounts.google.com",
+        "accounts.youtube.com",
+        "oauth",
+        "login",
+        "signin",
+        "auth"
+    )
 
-    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-        super.onPageStarted(view, url, favicon)
-        CookieFirewall.evaluateUrl(url)
-        
-        val script = """
-            javascript:(function() {
-                window.Notification = function() { return null; };
-                window.Notification.permission = 'denied';
-                window.Notification.requestPermission = function() { return Promise.resolve('denied'); };
-                if (navigator.serviceWorker) {
-                    navigator.serviceWorker.register = function() { return Promise.reject(new Error('Service workers disabled by browser policy')); };
-                }
-            })();
-        """.trimIndent()
-        view?.evaluateJavascript(script, null)
+    fun initialize() {
+        cookieManager.setAcceptCookie(false)
+        Log.d("CookieFirewall", "Cookie Firewall Initialized: Cookies Disabled")
     }
 
-    override fun shouldInterceptRequest(
-        view: WebView?,
-        request: WebResourceRequest?
-    ): WebResourceResponse? {
-        val url = request?.url?.toString()?.lowercase() ?: return super.shouldInterceptRequest(view, request)
-        
-        if (url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ttf")) {
-            Log.d("CustomWebClient", "Blocked font request: $url")
-            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+    fun isAuthRoute(url: String?): Boolean {
+        if (url == null) return false
+        val lowerUrl = url.lowercase()
+        return authWhitelist.any { lowerUrl.contains(it) }
+    }
+
+    fun evaluateUrl(webView: WebView?, url: String?) {
+        val auth = isAuthRoute(url)
+        if (auth != isAuthMode) {
+            isAuthMode = auth
+            cookieManager.setAcceptCookie(auth)
+            webView?.let {
+                cookieManager.setAcceptThirdPartyCookies(it, auth)
+            }
+            Log.d("CookieFirewall", "Auth mode switched to $auth. Cookies updated.")
         }
-
-        return super.shouldInterceptRequest(view, request)
-    }
-
-    override fun onPageFinished(view: WebView?, url: String?) {
-        super.onPageFinished(view, url)
-        onPageFinishedAction?.invoke(url)
     }
 }
