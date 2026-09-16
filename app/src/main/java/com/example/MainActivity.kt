@@ -28,7 +28,7 @@ class MainActivity : ComponentActivity() {
         lifecycleObserver = BrowserLifecycleObserver(
             app = application,
             onPurgeRequested = {
-                // UI purge if needed
+                System.gc()
             }
         )
         ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycleObserver)
