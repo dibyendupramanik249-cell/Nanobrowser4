@@ -17,7 +17,6 @@ import android.os.Environment
 import android.os.Process
 import android.util.Base64
 import android.view.KeyEvent
-import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -39,13 +38,14 @@ class MainActivity : Activity() {
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private val FILE_CHOOSER_REQUEST_CODE = 1001
 
-    private var lastFailedUrl: String? = null
+    private var lastTargetUrl: String = "https://www.google.com"
     private var hasNetworkError = false
     private lateinit var connectivityManager: ConnectivityManager
     private lateinit var networkCallback: ConnectivityManager.NetworkCallback
 
     private val desktopUserAgent =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    private var cleanMobileUserAgent: String = ""
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -116,14 +116,14 @@ class MainActivity : Activity() {
         configureWebView()
         setupNetworkAutoReconnect()
 
-        webView.loadUrl("https://www.google.com")
+        loadFormattedUrl(lastTargetUrl)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureWebView() {
         val settings = webView.settings
         settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true // Fixes Google AI Overview / client SPA routing
+        settings.domStorageEnabled = true
         settings.databaseEnabled = true
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
@@ -131,21 +131,37 @@ class MainActivity : Activity() {
         settings.builtInZoomControls = true
         settings.displayZoomControls = false
 
-        // Clean user agent: strip embedded WebView flags that break Google AI features
-        val rawUa = settings.userAgentString
-        val cleanMobileUa = rawUa.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+\\s?"), "")
-        settings.userAgentString = cleanMobileUa
+        // Sanitize mobile user agent to prevent Google from blocking AI Overview mode
+        val defaultUa = WebSettings.getDefaultUserAgent(this)
+        cleanMobileUserAgent = defaultUa
+            .replace("; wv", "")
+            .replace(Regex("Version/\\d+\\.\\d+\\s?"), "")
+        settings.userAgentString = cleanMobileUserAgent
 
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setAcceptThirdPartyCookies(webView, true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            CookieManager.getInstance().apply {
+                setAcceptCookie(true)
+                setAcceptThirdPartyCookies(webView, true)
+            }
         }
 
         webView.addJavascriptInterface(AndroidBlobBridge(), "AndroidBlobBridge")
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                return false
+                val url = request?.url?.toString() ?: return false
+                return if (url.startsWith("http://") || url.startsWith("https://")) {
+                    false
+                } else {
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                        startActivity(intent)
+                        true
+                    } catch (e: Exception) {
+                        true
+                    }
+                }
             }
 
             override fun onReceivedError(
@@ -155,7 +171,10 @@ class MainActivity : Activity() {
             ) {
                 if (request?.isForMainFrame == true) {
                     hasNetworkError = true
-                    lastFailedUrl = request.url.toString()
+                    val failedUrl = request.url.toString()
+                    if (!failedUrl.contains("chromewebdata")) {
+                        lastTargetUrl = failedUrl
+                    }
                 }
             }
 
@@ -170,19 +189,16 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (url != null && !url.contains("chromewebdata")) {
                     hasNetworkError = false
+                    lastTargetUrl = url
                 }
 
-                // Fix desktop mode scaling overlap
                 if (isDesktopMode) {
                     val script = """
                         (function() {
                             var meta = document.querySelector('meta[name="viewport"]');
-                            if (!meta) {
-                                meta = document.createElement('meta');
-                                meta.name = 'viewport';
-                                document.head.appendChild(meta);
+                            if (meta) {
+                                meta.setAttribute('content', 'width=1024');
                             }
-                            meta.content = 'width=1280, initial-scale=' + (screen.width / 1280.0);
                         })();
                     """.trimIndent()
                     view?.evaluateJavascript(script, null)
@@ -192,7 +208,7 @@ class MainActivity : Activity() {
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onShowFileChooser(
-                webView: WebView?,
+                view: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
                 fileChooserParams: FileChooserParams?
             ): Boolean {
@@ -204,13 +220,23 @@ class MainActivity : Activity() {
                     addCategory(Intent.CATEGORY_OPENABLE)
                 }
 
-                try {
+                return try {
                     startActivityForResult(intent, FILE_CHOOSER_REQUEST_CODE)
+                    true
                 } catch (e: Exception) {
-                    fileUploadCallback = null
-                    return false
+                    try {
+                        val fallback = Intent(Intent.ACTION_GET_CONTENT).apply {
+                            type = "*/*"
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                        }
+                        startActivityForResult(fallback, FILE_CHOOSER_REQUEST_CODE)
+                        true
+                    } catch (ex: Exception) {
+                        fileUploadCallback?.onReceiveValue(null)
+                        fileUploadCallback = null
+                        false
+                    }
                 }
-                return true
             }
         }
 
@@ -228,8 +254,13 @@ class MainActivity : Activity() {
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 runOnUiThread {
-                    if (hasNetworkError && !lastFailedUrl.isNullOrEmpty()) {
-                        webView.loadUrl(lastFailedUrl!!)
+                    if (hasNetworkError) {
+                        hasNetworkError = false
+                        webView.postDelayed({
+                            if (!isFinishing) {
+                                webView.loadUrl(lastTargetUrl)
+                            }
+                        }, 500)
                     }
                 }
             }
@@ -242,12 +273,11 @@ class MainActivity : Activity() {
         desktopButton.text = if (isDesktopMode) "M" else "D"
 
         val settings = webView.settings
-        if (isDesktopMode) {
-            settings.userAgentString = desktopUserAgent
-        } else {
-            val rawUa = WebSettings.getDefaultUserAgent(this)
-            settings.userAgentString = rawUa.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+\\s?"), "")
-        }
+        settings.userAgentString = if (isDesktopMode) desktopUserAgent else cleanMobileUserAgent
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+
+        webView.setInitialScale(0)
         webView.reload()
     }
 
@@ -257,8 +287,8 @@ class MainActivity : Activity() {
             input.contains(".") && !input.contains(" ") -> "https://$input"
             else -> "https://www.google.com/search?q=${Uri.encode(input)}"
         }
+        lastTargetUrl = target
         hasNetworkError = false
-        lastFailedUrl = target
         webView.loadUrl(target)
     }
 
@@ -325,9 +355,27 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
-            val results = if (resultCode == Activity.RESULT_OK && data != null) {
-                data.data?.let { arrayOf(it) }
-            } else null
+            if (fileUploadCallback == null) return
+
+            var results: Array<Uri>? = null
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                results = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
+                if (results == null || results.isEmpty()) {
+                    val clipData = data.clipData
+                    if (clipData != null && clipData.itemCount > 0) {
+                        val uriList = ArrayList<Uri>()
+                        for (i in 0 until clipData.itemCount) {
+                            uriList.add(clipData.getItemAt(i).uri)
+                        }
+                        results = uriList.toTypedArray()
+                    } else {
+                        data.data?.let { uri ->
+                            results = arrayOf(uri)
+                        }
+                    }
+                }
+            }
+
             fileUploadCallback?.onReceiveValue(results)
             fileUploadCallback = null
         }
@@ -351,7 +399,9 @@ class MainActivity : Activity() {
             connectivityManager.unregisterNetworkCallback(networkCallback)
         } catch (_: Exception) {}
 
-        // Recursive clean exit: 0.00 B cache footprint
+        fileUploadCallback?.onReceiveValue(null)
+        fileUploadCallback = null
+
         webView.stopLoading()
         webView.clearHistory()
         webView.clearCache(true)
