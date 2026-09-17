@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Process
 import android.provider.MediaStore
+import android.util.Base64
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -44,19 +45,27 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private var cameraOutputUri: Uri? = null
 
+    // Holds pending download request if storage permission prompt is triggered
+    private var pendingDownload: DownloadTask? = null
+
+    data class DownloadTask(
+        val url: String,
+        val userAgent: String,
+        val contentDisposition: String,
+        val mimeType: String
+    )
+
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
             val pickedUri = result.data?.data
             if (pickedUri != null) {
-                // User picked an existing file from Gallery or Files
                 fileUploadCallback?.onReceiveValue(arrayOf(pickedUri))
                 cameraOutputUri?.let { uri ->
                     try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
                 }
             } else if (cameraOutputUri != null) {
-                // User took a photo with Camera
                 val hasContent = try {
                     contentResolver.openInputStream(cameraOutputUri!!)?.use { it.read() != -1 } ?: false
                 } catch (_: Exception) {
@@ -66,7 +75,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 if (hasContent) {
                     fileUploadCallback?.onReceiveValue(arrayOf(cameraOutputUri!!))
                 } else {
-                    // Fallback for camera apps returning thumbnail bitmap in intent data
                     val thumb = result.data?.extras?.get("data") as? Bitmap
                     if (thumb != null) {
                         try {
@@ -86,7 +94,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 fileUploadCallback?.onReceiveValue(results)
             }
         } else {
-            // User cancelled capture
             cameraOutputUri?.let { uri ->
                 try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
             }
@@ -257,7 +264,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
 
-                // Create a system-managed content URI with write permissions for external camera apps
                 cameraOutputUri = try {
                     val values = ContentValues().apply {
                         put(MediaStore.Images.Media.TITLE, "IMG_${System.currentTimeMillis()}")
@@ -309,36 +315,15 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         }
 
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            val task = DownloadTask(url, userAgent, contentDisposition, mimetype)
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
                 checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
             ) {
+                pendingDownload = task
                 requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 102)
                 return@setDownloadListener
             }
-
-            try {
-                val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
-                val request = DownloadManager.Request(Uri.parse(url)).apply {
-                    setMimeType(mimetype)
-                    addRequestHeader("User-Agent", userAgent)
-                    val cookies = CookieManager.getInstance().getCookie(url)
-                    if (cookies != null) {
-                        addRequestHeader("Cookie", cookies)
-                    }
-                    setDescription("Downloading file")
-                    setTitle(fileName)
-                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                    allowScanningByMediaScanner()
-                }
-                val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
-                dm.enqueue(request)
-                Toast.makeText(this@MainActivity, "Download started: $fileName", Toast.LENGTH_SHORT).show()
-            } catch (_: Exception) {
-                try {
-                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                } catch (_: Exception) {}
-            }
+            executeDownload(task)
         }
 
         webView.webViewClient = object : WebViewClient() {
@@ -408,6 +393,86 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 }
 
                 return super.shouldInterceptRequest(view, request)
+            }
+        }
+    }
+
+    private fun executeDownload(task: DownloadTask) {
+        val url = task.url
+
+        // Handle Base64 Data URIs without hitting DownloadManager
+        if (url.startsWith("data:")) {
+            Thread {
+                try {
+                    val parts = url.split(",")
+                    if (parts.size > 1) {
+                        val header = parts[0]
+                        val rawData = parts[1]
+                        val bytes = Base64.decode(rawData, Base64.DEFAULT)
+                        val ext = when {
+                            header.contains("image/png") -> ".png"
+                            header.contains("image/jpeg") || header.contains("image/jpg") -> ".jpg"
+                            header.contains("image/webp") -> ".webp"
+                            header.contains("application/pdf") -> ".pdf"
+                            else -> ".bin"
+                        }
+                        val fileName = "download_${System.currentTimeMillis()}$ext"
+                        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                        downloadsDir.mkdirs()
+                        val targetFile = File(downloadsDir, fileName)
+                        targetFile.outputStream().use { it.write(bytes) }
+
+                        runOnUiThread {
+                            Toast.makeText(this, "Saved to Downloads: $fileName", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }.start()
+            return
+        }
+
+        // Standard HTTP / HTTPS Downloads
+        try {
+            val fileName = URLUtil.guessFileName(url, task.contentDisposition, task.mimeType)
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            downloadsDir.mkdirs()
+
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                if (task.mimeType.isNotEmpty()) {
+                    setMimeType(task.mimeType)
+                }
+                addRequestHeader("User-Agent", task.userAgent)
+                val cookies = CookieManager.getInstance().getCookie(url)
+                if (!cookies.isNullOrEmpty()) {
+                    addRequestHeader("Cookie", cookies)
+                }
+                addRequestHeader("Referer", webView.url ?: url)
+                setDescription("Downloading file...")
+                setTitle(fileName)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                @Suppress("DEPRECATION")
+                allowScanningByMediaScanner()
+            }
+
+            val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+            dm.enqueue(request)
+            Toast.makeText(this, "Download started: $fileName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 102 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            pendingDownload?.let {
+                executeDownload(it)
+                pendingDownload = null
             }
         }
     }
