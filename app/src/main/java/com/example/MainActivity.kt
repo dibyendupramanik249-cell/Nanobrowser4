@@ -1,20 +1,26 @@
 package com.example
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.ComponentCallbacks2
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.os.Process
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.webkit.*
+import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -24,8 +30,26 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private lateinit var webView: WebView
     private lateinit var urlBar: EditText
     private lateinit var progressBar: ProgressBar
+    private lateinit var desktopBtn: Button
 
-    // Blacklist high-overhead tracking scripts and ad networks
+    private var isDesktopMode = false
+    private var defaultUserAgent: String = ""
+    private val desktopUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val results = if (result.resultCode == RESULT_OK) {
+            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+        } else {
+            null
+        }
+        fileUploadCallback?.onReceiveValue(results)
+        fileUploadCallback = null
+    }
+
     private val blockedDomains = hashSetOf(
         "doubleclick.net", "googlesyndication.com", "google-analytics.com",
         "adservice.google.com", "facebook.net", "scorecardresearch.com",
@@ -36,15 +60,19 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Lock system bar colors to dark mode
         window.statusBarColor = Color.parseColor("#121212")
         window.navigationBarColor = Color.BLACK
 
-        // Root container with system window insets to clear status bar and gesture bar
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
             fitsSystemWindows = true
+        }
+
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#121212"))
+            gravity = Gravity.CENTER_VERTICAL
         }
 
         urlBar = EditText(this).apply {
@@ -55,17 +83,49 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             hint = "Search or type URL"
             setBackgroundColor(Color.parseColor("#1E1E1E"))
             setPadding(28, 20, 28, 20)
+
+            // Auto-clear input immediately upon tap or focus
+            setOnClickListener { setText("") }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) setText("")
+            }
+
             setOnEditorActionListener { _, actionId, event ->
                 if (actionId == EditorInfo.IME_ACTION_GO ||
                     (event?.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
                 ) {
                     loadInput(text.toString())
+                    clearFocus()
                     true
                 } else {
                     false
                 }
             }
         }
+
+        desktopBtn = Button(this).apply {
+            text = "DESK"
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(20, 0, 20, 0)
+            setOnClickListener {
+                isDesktopMode = !isDesktopMode
+                if (isDesktopMode) {
+                    webView.settings.userAgentString = desktopUserAgent
+                    webView.settings.useWideViewPort = true
+                    webView.settings.loadWithOverviewMode = true
+                    setTextColor(Color.CYAN)
+                } else {
+                    webView.settings.userAgentString = defaultUserAgent
+                    setTextColor(Color.GRAY)
+                }
+                webView.reload()
+            }
+        }
+
+        topBar.addView(urlBar, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        topBar.addView(desktopBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
 
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -80,13 +140,25 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             )
         }
 
-        rootLayout.addView(urlBar)
+        rootLayout.addView(topBar)
         rootLayout.addView(progressBar)
         rootLayout.addView(webView)
         setContentView(rootLayout)
 
+        checkMediaPermissions()
         applyStrictEngineSettings()
         webView.loadUrl("https://www.google.com")
+    }
+
+    private fun checkMediaPermissions() {
+        val permissions = arrayOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO
+        )
+        val needed = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (needed.isNotEmpty()) {
+            requestPermissions(needed.toTypedArray(), 101)
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -101,6 +173,8 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         s.displayZoomControls = false
         s.useWideViewPort = true
         s.loadWithOverviewMode = true
+
+        defaultUserAgent = s.userAgentString
 
         // Strict memory ceilings
         s.offscreenPreRaster = false
@@ -119,6 +193,53 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 } else {
                     progressBar.visibility = View.GONE
                 }
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                runOnUiThread {
+                    request?.grant(request.resources)
+                }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                fileUploadCallback?.onReceiveValue(null)
+                fileUploadCallback = filePathCallback
+                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                    type = "*/*"
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                }
+                try {
+                    fileChooserLauncher.launch(intent)
+                } catch (_: Exception) {
+                    fileUploadCallback = null
+                    return false
+                }
+                return true
+            }
+        }
+
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            try {
+                val request = DownloadManager.Request(Uri.parse(url)).apply {
+                    setMimeType(mimetype)
+                    addRequestHeader("User-Agent", userAgent)
+                    setDescription("Downloading file")
+                    val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
+                    setTitle(fileName)
+                    // Auto-clears notification immediately upon download completion
+                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                }
+                val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+                dm.enqueue(request)
+            } catch (_: Exception) {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (_: Exception) {}
             }
         }
 
@@ -156,12 +277,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 val url = request?.url ?: return null
                 val host = url.host ?: ""
 
-                // Block ad and tracking scripts to prevent CPU drain and memory expansion
                 if (blockedDomains.any { host.contains(it) }) {
                     return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                 }
 
-                // Fonts are preserved so icon ligatures and typography render accurately
                 return super.shouldInterceptRequest(view, request)
             }
         }
