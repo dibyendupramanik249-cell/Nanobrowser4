@@ -2,7 +2,9 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ClipData
 import android.content.ComponentCallbacks2
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -12,7 +14,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Process
-import android.os.StrictMode
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.KeyEvent
@@ -47,30 +48,52 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
-            val dataUri = result.data?.data
-            if (dataUri != null) {
-                // User picked an image from Gallery
-                fileUploadCallback?.onReceiveValue(arrayOf(dataUri))
-            } else {
+            val pickedUri = result.data?.data
+            if (pickedUri != null) {
+                // User picked an existing file from Gallery or Files
+                fileUploadCallback?.onReceiveValue(arrayOf(pickedUri))
+                cameraOutputUri?.let { uri ->
+                    try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+                }
+            } else if (cameraOutputUri != null) {
                 // User took a photo with Camera
-                val photoFile = File(cacheDir, "camera_capture.jpg")
-                if (photoFile.exists() && photoFile.length() > 0) {
-                    fileUploadCallback?.onReceiveValue(arrayOf(Uri.fromFile(photoFile)))
+                val hasContent = try {
+                    contentResolver.openInputStream(cameraOutputUri!!)?.use { it.read() != -1 } ?: false
+                } catch (_: Exception) {
+                    false
+                }
+
+                if (hasContent) {
+                    fileUploadCallback?.onReceiveValue(arrayOf(cameraOutputUri!!))
                 } else {
-                    val clipData = result.data?.clipData
-                    if (clipData != null && clipData.itemCount > 0) {
-                        val uris = Array(clipData.itemCount) { i -> clipData.getItemAt(i).uri }
-                        fileUploadCallback?.onReceiveValue(uris)
+                    // Fallback for camera apps returning thumbnail bitmap in intent data
+                    val thumb = result.data?.extras?.get("data") as? Bitmap
+                    if (thumb != null) {
+                        try {
+                            contentResolver.openOutputStream(cameraOutputUri!!)?.use { out ->
+                                thumb.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                            }
+                            fileUploadCallback?.onReceiveValue(arrayOf(cameraOutputUri!!))
+                        } catch (_: Exception) {
+                            fileUploadCallback?.onReceiveValue(null)
+                        }
                     } else {
-                        val results = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-                        fileUploadCallback?.onReceiveValue(results)
+                        fileUploadCallback?.onReceiveValue(null)
                     }
                 }
+            } else {
+                val results = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                fileUploadCallback?.onReceiveValue(results)
             }
         } else {
+            // User cancelled capture
+            cameraOutputUri?.let { uri ->
+                try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+            }
             fileUploadCallback?.onReceiveValue(null)
         }
         fileUploadCallback = null
+        cameraOutputUri = null
     }
 
     private val blockedDomains = hashSetOf(
@@ -82,10 +105,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Bypass file URI checks on Android 7 to allow camera capture without complex providers
-        val policy = StrictMode.VmPolicy.Builder()
-        StrictMode.setVmPolicy(policy.build())
 
         window.statusBarColor = Color.parseColor("#121212")
         window.navigationBarColor = Color.BLACK
@@ -238,12 +257,31 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
 
-                val photoFile = File(cacheDir, "camera_capture.jpg")
-                if (photoFile.exists()) photoFile.delete()
-                cameraOutputUri = Uri.fromFile(photoFile)
+                // Create a system-managed content URI with write permissions for external camera apps
+                cameraOutputUri = try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Images.Media.TITLE, "IMG_${System.currentTimeMillis()}")
+                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    }
+                    contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                } catch (_: Exception) {
+                    null
+                }
 
                 val captureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
-                    putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri)
+                    if (cameraOutputUri != null) {
+                        putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri)
+                        clipData = ClipData.newUri(contentResolver, "photo", cameraOutputUri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    }
+                }
+
+                if (cameraOutputUri != null) {
+                    val resInfoList = packageManager.queryIntentActivities(captureIntent, PackageManager.MATCH_DEFAULT_ONLY)
+                    for (resolveInfo in resInfoList) {
+                        val pkg = resolveInfo.activityInfo.packageName
+                        grantUriPermission(pkg, cameraOutputUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
                 }
 
                 val contentIntent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
@@ -311,7 +349,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                // Force desktop viewport to prevent responsive sites from collapsing into mobile layout
                 if (isDesktopMode) {
                     view?.evaluateJavascript(
                         """
@@ -333,7 +370,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 var url = request?.url?.toString() ?: return false
 
-                // Prevent mobile subdomain redirects while desktop mode is active
                 if (isDesktopMode && url.contains("://m.")) {
                     url = url.replace("://m.", "://www.")
                     view?.loadUrl(url)
