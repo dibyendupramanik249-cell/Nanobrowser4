@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.Network
@@ -36,27 +37,36 @@ class MainActivity : Activity() {
 
     private var isDesktopMode = false
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingPermissionRequest: PermissionRequest? = null
+
     private val FILE_CHOOSER_REQUEST_CODE = 1001
+    private val PERMISSION_REQUEST_CODE = 1002
 
     private var lastTargetUrl: String = "https://www.google.com"
     private var hasNetworkError = false
     private lateinit var connectivityManager: ConnectivityManager
     private lateinit var networkCallback: ConnectivityManager.NetworkCallback
 
+    // Clean Chrome Mobile UA recognized by Google OAuth, AI Overview, and Google Lens
+    private val mobileUserAgent =
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+
+    // Clean Desktop Chrome UA
     private val desktopUserAgent =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    private var cleanMobileUserAgent: String = ""
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // fitsSystemWindows prevents system status bar from overlapping top bar
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
+            fitsSystemWindows = true
         }
 
         val topBar = LinearLayout(this).apply {
@@ -65,6 +75,8 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
+            val paddingPx = (6 * resources.displayMetrics.density).toInt()
+            setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
         }
 
         urlEditText = EditText(this).apply {
@@ -125,18 +137,17 @@ class MainActivity : Activity() {
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.databaseEnabled = true
+        settings.javaScriptCanOpenWindowsAutomatically = true
+        settings.mediaPlaybackRequiresUserGesture = false
+
+        // Viewport and layout overview settings
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
         settings.setSupportZoom(true)
         settings.builtInZoomControls = true
         settings.displayZoomControls = false
 
-        // Sanitize mobile user agent to prevent Google from blocking AI Overview mode
-        val defaultUa = WebSettings.getDefaultUserAgent(this)
-        cleanMobileUserAgent = defaultUa
-            .replace("; wv", "")
-            .replace(Regex("Version/\\d+\\.\\d+\\s?"), "")
-        settings.userAgentString = cleanMobileUserAgent
+        settings.userAgentString = mobileUserAgent
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
@@ -144,6 +155,16 @@ class MainActivity : Activity() {
                 setAcceptCookie(true)
                 setAcceptThirdPartyCookies(webView, true)
             }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                ServiceWorkerController.getInstance().serviceWorkerWebSettings.apply {
+                    allowContentAccess = true
+                    allowFileAccess = true
+                    blockNetworkLoads = false
+                }
+            } catch (_: Exception) {}
         }
 
         webView.addJavascriptInterface(AndroidBlobBridge(), "AndroidBlobBridge")
@@ -192,12 +213,13 @@ class MainActivity : Activity() {
                     lastTargetUrl = url
                 }
 
+                // In desktop mode, remove mobile viewport tags so desktop sites scale correctly
                 if (isDesktopMode) {
                     val script = """
                         (function() {
-                            var meta = document.querySelector('meta[name="viewport"]');
-                            if (meta) {
-                                meta.setAttribute('content', 'width=1024');
+                            var metas = document.querySelectorAll('meta[name="viewport"]');
+                            for (var i = 0; i < metas.length; i++) {
+                                metas[i].parentNode.removeChild(metas[i]);
                             }
                         })();
                     """.trimIndent()
@@ -207,6 +229,35 @@ class MainActivity : Activity() {
         }
 
         webView.webChromeClient = object : WebChromeClient() {
+            // Fix: Handles Google Lens live camera and voice search permissions
+            override fun onPermissionRequest(request: PermissionRequest) {
+                runOnUiThread {
+                    val requestedResources = request.resources
+                    val permissionsNeeded = mutableListOf<String>()
+
+                    for (resource in requestedResources) {
+                        if (resource == PermissionRequest.RESOURCE_VIDEO_CAPTURE) {
+                            if (checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                                permissionsNeeded.add(android.Manifest.permission.CAMERA)
+                            }
+                        }
+                        if (resource == PermissionRequest.RESOURCE_AUDIO_CAPTURE) {
+                            if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                                permissionsNeeded.add(android.Manifest.permission.RECORD_AUDIO)
+                            }
+                        }
+                    }
+
+                    if (permissionsNeeded.isNotEmpty()) {
+                        pendingPermissionRequest = request
+                        requestPermissions(permissionsNeeded.toTypedArray(), PERMISSION_REQUEST_CODE)
+                    } else {
+                        request.grant(request.resources)
+                    }
+                }
+            }
+
+            // Fix: Handles file uploads and Google Lens image picker
             override fun onShowFileChooser(
                 view: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -245,6 +296,7 @@ class MainActivity : Activity() {
         }
     }
 
+    // Auto-detects data restore and automatically reloads without restarting the app
     private fun setupNetworkAutoReconnect() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val request = NetworkRequest.Builder()
@@ -257,7 +309,7 @@ class MainActivity : Activity() {
                     if (hasNetworkError) {
                         hasNetworkError = false
                         webView.postDelayed({
-                            if (!isFinishing) {
+                            if (!isFinishing && !isDestroyed) {
                                 webView.loadUrl(lastTargetUrl)
                             }
                         }, 500)
@@ -273,10 +325,7 @@ class MainActivity : Activity() {
         desktopButton.text = if (isDesktopMode) "M" else "D"
 
         val settings = webView.settings
-        settings.userAgentString = if (isDesktopMode) desktopUserAgent else cleanMobileUserAgent
-        settings.useWideViewPort = true
-        settings.loadWithOverviewMode = true
-
+        settings.userAgentString = if (isDesktopMode) desktopUserAgent else mobileUserAgent
         webView.setInitialScale(0)
         webView.reload()
     }
@@ -352,6 +401,23 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            if (granted) {
+                pendingPermissionRequest?.grant(pendingPermissionRequest?.resources)
+            } else {
+                pendingPermissionRequest?.deny()
+            }
+            pendingPermissionRequest = null
+        }
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
@@ -386,6 +452,19 @@ class MainActivity : Activity() {
         imm.hideSoftInputFromWindow(urlEditText.windowToken, 0)
     }
 
+    // Battery optimization: pause timers and animations when screen off or minimized
+    override fun onPause() {
+        super.onPause()
+        webView.onPause()
+        webView.pauseTimers()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        webView.onResume()
+        webView.resumeTimers()
+    }
+
     override fun onBackPressed() {
         if (webView.canGoBack()) {
             webView.goBack()
@@ -401,7 +480,10 @@ class MainActivity : Activity() {
 
         fileUploadCallback?.onReceiveValue(null)
         fileUploadCallback = null
+        pendingPermissionRequest?.deny()
+        pendingPermissionRequest = null
 
+        // 0.00 B cache footprint on clean exit
         webView.stopLoading()
         webView.clearHistory()
         webView.clearCache(true)
