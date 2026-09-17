@@ -8,9 +8,12 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Process
+import android.os.StrictMode
+import android.provider.MediaStore
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -20,6 +23,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import java.io.ByteArrayInputStream
@@ -34,19 +38,38 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
     private var isDesktopMode = false
     private var defaultUserAgent: String = ""
-    private val desktopUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    private val desktopUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private var cameraOutputUri: Uri? = null
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        val results = if (result.resultCode == RESULT_OK) {
-            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+        if (result.resultCode == RESULT_OK) {
+            val dataUri = result.data?.data
+            if (dataUri != null) {
+                // User picked an image from Gallery
+                fileUploadCallback?.onReceiveValue(arrayOf(dataUri))
+            } else {
+                // User took a photo with Camera
+                val photoFile = File(cacheDir, "camera_capture.jpg")
+                if (photoFile.exists() && photoFile.length() > 0) {
+                    fileUploadCallback?.onReceiveValue(arrayOf(Uri.fromFile(photoFile)))
+                } else {
+                    val clipData = result.data?.clipData
+                    if (clipData != null && clipData.itemCount > 0) {
+                        val uris = Array(clipData.itemCount) { i -> clipData.getItemAt(i).uri }
+                        fileUploadCallback?.onReceiveValue(uris)
+                    } else {
+                        val results = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                        fileUploadCallback?.onReceiveValue(results)
+                    }
+                }
+            }
         } else {
-            null
+            fileUploadCallback?.onReceiveValue(null)
         }
-        fileUploadCallback?.onReceiveValue(results)
         fileUploadCallback = null
     }
 
@@ -59,6 +82,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Bypass file URI checks on Android 7 to allow camera capture without complex providers
+        val policy = StrictMode.VmPolicy.Builder()
+        StrictMode.setVmPolicy(policy.build())
 
         window.statusBarColor = Color.parseColor("#121212")
         window.navigationBarColor = Color.BLACK
@@ -84,7 +111,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             setBackgroundColor(Color.parseColor("#1E1E1E"))
             setPadding(28, 20, 28, 20)
 
-            // Auto-clear input immediately upon tap or focus
             setOnClickListener { setText("") }
             setOnFocusChangeListener { _, hasFocus ->
                 if (hasFocus) setText("")
@@ -145,16 +171,20 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         rootLayout.addView(webView)
         setContentView(rootLayout)
 
-        checkMediaPermissions()
+        checkRequiredPermissions()
         applyStrictEngineSettings()
         webView.loadUrl("https://www.google.com")
     }
 
-    private fun checkMediaPermissions() {
-        val permissions = arrayOf(
+    private fun checkRequiredPermissions() {
+        val permissions = mutableListOf(
             android.Manifest.permission.CAMERA,
             android.Manifest.permission.RECORD_AUDIO
         )
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            permissions.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            permissions.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
         val needed = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (needed.isNotEmpty()) {
             requestPermissions(needed.toTypedArray(), 101)
@@ -176,7 +206,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
         defaultUserAgent = s.userAgentString
 
-        // Strict memory ceilings
         s.offscreenPreRaster = false
         s.mediaPlaybackRequiresUserGesture = true
         s.cacheMode = WebSettings.LOAD_NO_CACHE
@@ -208,13 +237,32 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             ): Boolean {
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
-                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+
+                val photoFile = File(cacheDir, "camera_capture.jpg")
+                if (photoFile.exists()) photoFile.delete()
+                cameraOutputUri = Uri.fromFile(photoFile)
+
+                val captureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                    putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri)
+                }
+
+                val contentIntent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
                     type = "*/*"
                     addCategory(Intent.CATEGORY_OPENABLE)
                 }
+
+                val chooserIntent = Intent(Intent.ACTION_CHOOSER).apply {
+                    putExtra(Intent.EXTRA_INTENT, contentIntent)
+                    putExtra(Intent.EXTRA_TITLE, "Select Camera or File")
+                    if (captureIntent.resolveActivity(packageManager) != null) {
+                        putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf(captureIntent))
+                    }
+                }
+
                 try {
-                    fileChooserLauncher.launch(intent)
+                    fileChooserLauncher.launch(chooserIntent)
                 } catch (_: Exception) {
+                    fileUploadCallback?.onReceiveValue(null)
                     fileUploadCallback = null
                     return false
                 }
@@ -223,19 +271,31 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         }
 
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 102)
+                return@setDownloadListener
+            }
+
             try {
+                val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
                     setMimeType(mimetype)
                     addRequestHeader("User-Agent", userAgent)
+                    val cookies = CookieManager.getInstance().getCookie(url)
+                    if (cookies != null) {
+                        addRequestHeader("Cookie", cookies)
+                    }
                     setDescription("Downloading file")
-                    val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
                     setTitle(fileName)
-                    // Auto-clears notification immediately upon download completion
-                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                     setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                    allowScanningByMediaScanner()
                 }
                 val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
                 dm.enqueue(request)
+                Toast.makeText(this@MainActivity, "Download started: $fileName", Toast.LENGTH_SHORT).show()
             } catch (_: Exception) {
                 try {
                     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -249,11 +309,41 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 urlBar.setText(url)
             }
 
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                // Force desktop viewport to prevent responsive sites from collapsing into mobile layout
+                if (isDesktopMode) {
+                    view?.evaluateJavascript(
+                        """
+                        (function() {
+                            var meta = document.querySelector('meta[name="viewport"]');
+                            if (!meta) {
+                                meta = document.createElement('meta');
+                                meta.name = 'viewport';
+                                document.head.appendChild(meta);
+                            }
+                            meta.setAttribute('content', 'width=1100');
+                        })();
+                        """.trimIndent(),
+                        null
+                    )
+                }
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url?.toString() ?: return false
+                var url = request?.url?.toString() ?: return false
+
+                // Prevent mobile subdomain redirects while desktop mode is active
+                if (isDesktopMode && url.contains("://m.")) {
+                    url = url.replace("://m.", "://www.")
+                    view?.loadUrl(url)
+                    return true
+                }
+
                 if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("about:blank")) {
                     return false
                 }
+
                 try {
                     val intent = if (url.startsWith("intent:")) {
                         Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
