@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -45,7 +46,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private var cameraOutputUri: Uri? = null
 
-    // Holds pending download request if storage permission prompt is triggered
     private var pendingDownload: DownloadTask? = null
 
     data class DownloadTask(
@@ -108,6 +108,14 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         "adservice.google.com", "facebook.net", "scorecardresearch.com",
         "criteo.com", "taboola.com", "outbrain.com", "amazon-adsystem.com"
     )
+
+    // Bridge for direct in-memory blob conversion
+    inner class BlobDownloadBridge {
+        @JavascriptInterface
+        fun processBlob(base64Data: String, mimeType: String) {
+            saveRawBase64(base64Data, mimeType)
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -239,6 +247,8 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, false)
+
+        webView.addJavascriptInterface(BlobDownloadBridge(), "AndroidBlobBridge")
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -400,42 +410,34 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private fun executeDownload(task: DownloadTask) {
         val url = task.url
 
-        // Handle Base64 Data URIs without hitting DownloadManager
-        if (url.startsWith("data:")) {
-            Thread {
-                try {
-                    val parts = url.split(",")
-                    if (parts.size > 1) {
-                        val header = parts[0]
-                        val rawData = parts[1]
-                        val bytes = Base64.decode(rawData, Base64.DEFAULT)
-                        val ext = when {
-                            header.contains("image/png") -> ".png"
-                            header.contains("image/jpeg") || header.contains("image/jpg") -> ".jpg"
-                            header.contains("image/webp") -> ".webp"
-                            header.contains("application/pdf") -> ".pdf"
-                            else -> ".bin"
-                        }
-                        val fileName = "download_${System.currentTimeMillis()}$ext"
-                        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                        downloadsDir.mkdirs()
-                        val targetFile = File(downloadsDir, fileName)
-                        targetFile.outputStream().use { it.write(bytes) }
-
-                        runOnUiThread {
-                            Toast.makeText(this, "Saved to Downloads: $fileName", Toast.LENGTH_LONG).show()
-                        }
-                    }
-                } catch (e: Exception) {
-                    runOnUiThread {
-                        Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }.start()
+        // Handle client-side Blob URLs (Google Flow, web video renderers)
+        if (url.startsWith("blob:")) {
+            Toast.makeText(this, "Downloading video...", Toast.LENGTH_SHORT).show()
+            val js = """
+                (function() {
+                    fetch('$url')
+                    .then(response => response.blob())
+                    .then(blob => {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            window.AndroidBlobBridge.processBlob(reader.result, blob.type);
+                        };
+                        reader.readAsDataURL(blob);
+                    })
+                    .catch(err => console.error(err));
+                })();
+            """.trimIndent()
+            webView.evaluateJavascript(js, null)
             return
         }
 
-        // Standard HTTP / HTTPS Downloads
+        // Handle inline Data URIs
+        if (url.startsWith("data:")) {
+            saveRawBase64(url, task.mimeType)
+            return
+        }
+
+        // Standard HTTP / HTTPS Downloads via DownloadManager
         try {
             val fileName = URLUtil.guessFileName(url, task.contentDisposition, task.mimeType)
             val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -465,6 +467,51 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         } catch (e: Exception) {
             Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun saveRawBase64(dataUri: String, mimeTypeHint: String) {
+        Thread {
+            try {
+                val commaIndex = dataUri.indexOf(",")
+                if (commaIndex != -1) {
+                    val header = dataUri.substring(0, commaIndex)
+                    val rawBase64 = dataUri.substring(commaIndex + 1)
+                    val bytes = Base64.decode(rawBase64, Base64.DEFAULT)
+
+                    val extension = when {
+                        header.contains("video/mp4") || mimeTypeHint.contains("video/mp4") -> ".mp4"
+                        header.contains("video/webm") || mimeTypeHint.contains("video/webm") -> ".webm"
+                        header.contains("image/png") -> ".png"
+                        header.contains("image/jpeg") || header.contains("image/jpg") -> ".jpg"
+                        header.contains("image/webp") -> ".webp"
+                        header.contains("application/pdf") -> ".pdf"
+                        else -> ".mp4"
+                    }
+
+                    val fileName = "Flow_Video_${System.currentTimeMillis()}$extension"
+                    val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    downloadsDir.mkdirs()
+                    val targetFile = File(downloadsDir, fileName)
+
+                    targetFile.outputStream().use { it.write(bytes) }
+
+                    MediaScannerConnection.scanFile(
+                        this@MainActivity,
+                        arrayOf(targetFile.absolutePath),
+                        arrayOf("video/mp4"),
+                        null
+                    )
+
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Saved to Downloads: $fileName", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.start()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
