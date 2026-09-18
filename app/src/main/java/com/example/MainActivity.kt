@@ -37,6 +37,9 @@ import androidx.appcompat.app.AppCompatActivity
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.Charset
 
 class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
@@ -540,6 +543,20 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                 }
 
+                // Desktop mode: responsive sites choose mobile/desktop layout by
+                // VIEWPORT WIDTH, not by User-Agent — so the desktop UA alone
+                // leaves them looking mobile. Rewrite the viewport meta inside
+                // the HTML BEFORE the renderer lays the page out (the old
+                // post-layout JS injection is what caused the zoom-in bug).
+                if (isDesktopMode && request.isForMainFrame &&
+                    request.method.equals("GET", ignoreCase = true) &&
+                    (url.scheme == "https" || url.scheme == "http")
+                ) {
+                    val rewritten = forceDesktopViewport(url.toString(), request.requestHeaders)
+                    if (rewritten != null) return rewritten
+                    // fall through — on any failure WebView loads it normally
+                }
+
                 return super.shouldInterceptRequest(view, request)
             }
 
@@ -671,6 +688,88 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             Toast.makeText(this, "Download started: $fileName", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ---- Desktop-mode site compatibility (responsive-site fix) ----
+    // Fetches the main-frame HTML ourselves, forces the viewport meta to
+    // width=1100, and serves the modified document — all BEFORE the renderer
+    // lays the page out, so the desktop layout renders with a correct fit-zoom
+    // (unlike the old post-layout injection). Only the main document is
+    // buffered (typically a few hundred KB, transient). Any failure returns
+    // null, letting WebView load the page untouched.
+    private fun forceDesktopViewport(url: String, headers: Map<String, String>): WebResourceResponse? {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15_000
+                readTimeout = 15_000
+                instanceFollowRedirects = true
+                for ((k, v) in headers) {
+                    if (k.equals("Accept-Encoding", ignoreCase = true)) continue
+                    try { setRequestProperty(k, v) } catch (_: Exception) {}
+                }
+                setRequestProperty("User-Agent", desktopUserAgent)
+                setRequestProperty("Accept-Encoding", "identity") // plain text — no gzip juggling
+                val cookies = CookieManager.getInstance().getCookie(url)
+                if (!cookies.isNullOrEmpty()) setRequestProperty("Cookie", cookies)
+            }
+            if (conn.responseCode !in 200..299) return null
+
+            // If the server ignored our "identity" request and compressed the
+            // body anyway, bail out — serving compressed bytes as HTML would
+            // corrupt the page.
+            val encoding = conn.contentEncoding
+            if (encoding != null && !encoding.equals("identity", ignoreCase = true)) return null
+
+            val mime = conn.contentType ?: "text/html"
+            if (!mime.contains("html", ignoreCase = true)) return null
+
+            val bytes = conn.inputStream.use { it.readBytes() }
+            // Very large documents: serve as downloaded, skip the rewrite.
+            if (bytes.size > 5_000_000) {
+                return WebResourceResponse(mime, "utf-8", ByteArrayInputStream(bytes))
+            }
+
+            // Sniff the charset from the header AND the HTML head (the meta
+            // charset tag) — decoding with the wrong charset would corrupt
+            // every non-ASCII character in the page.
+            val head = String(bytes.copyOfRange(0, minOf(2048, bytes.size)), charset("ISO-8859-1"))
+            val charsetName = Regex("""charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""")
+                .find(mime + " " + head)?.groupValues?.get(1)
+                ?.takeIf { runCatching { Charset.isSupported(it) }.getOrDefault(false) } ?: "utf-8"
+
+            val finalBytes: ByteArray = try {
+                var html = String(bytes, charset(charsetName))
+                val metaTag = Regex(
+                    """<meta[^>]*name\s*=\s*("viewport"|'viewport')[^>]*>""",
+                    RegexOption.IGNORE_CASE
+                )
+                val contentAttr = Regex(
+                    """content\s*=\s*("[^"]*"|'[^']*')""",
+                    RegexOption.IGNORE_CASE
+                )
+                var rewrote = false
+                html = metaTag.replace(html) { m ->
+                    val tag = m.value
+                    val newTag = if (contentAttr.containsMatchIn(tag)) {
+                        contentAttr.replace(tag, "content=\"width=1100\"")
+                    } else {
+                        tag.replaceFirst(">", " content=\"width=1100\">")
+                    }
+                    if (newTag != tag) rewrote = true
+                    newTag
+                }
+                if (rewrote) html.toByteArray(charset(charsetName)) else bytes
+            } catch (_: Exception) {
+                bytes // any charset trouble → serve untouched bytes
+            }
+
+            return WebResourceResponse(mime, charsetName, ByteArrayInputStream(finalBytes))
+        } catch (_: Exception) {
+            return null
+        } finally {
+            conn?.disconnect()
         }
     }
 
