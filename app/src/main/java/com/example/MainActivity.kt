@@ -315,7 +315,14 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 var captured = false
                 temp.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
-                        val target = request?.url?.toString() ?: return true
+                        val target = request?.url?.toString() ?: return false
+                        // CRITICAL: window.open flows (e.g. Google's AI Overview
+                        // → "AI Mode") create the popup with about:blank FIRST and
+                        // set its location afterwards. Blocking the blank load
+                        // kills the whole flow — so let it through.
+                        if (target == "about:blank" || target.startsWith("data:")) {
+                            return false
+                        }
                         if (!captured && (target.startsWith("http://") || target.startsWith("https://"))) {
                             captured = true
                             view.loadUrl(target)
@@ -324,12 +331,38 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                                 if (popupCaptureWebView === v) popupCaptureWebView = null
                             }
                         }
-                        return true // the temp view must never actually load anything
+                        return true // the temp view never actually loads real content
+                    }
+
+                    // Fallback capture: POST navigations can bypass
+                    // shouldOverrideUrlLoading on some WebView builds.
+                    override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
+                        super.onPageStarted(v, url, favicon)
+                        if (!captured && url != null &&
+                            (url.startsWith("http://") || url.startsWith("https://"))
+                        ) {
+                            captured = true
+                            view.loadUrl(url)
+                            v?.post {
+                                try { v.destroy() } catch (_: Exception) {}
+                                if (popupCaptureWebView === v) popupCaptureWebView = null
+                            }
+                        }
                     }
                 }
                 popupCaptureWebView = temp
                 transport.webView = temp
                 resultMsg.sendToTarget()
+
+                // If nothing was ever captured (dead popup), free the popup
+                // slot and the memory after 15s — Chromium refuses to create
+                // a new popup while one is still pending.
+                temp.postDelayed({
+                    if (popupCaptureWebView === temp) {
+                        try { temp.destroy() } catch (_: Exception) {}
+                        popupCaptureWebView = null
+                    }
+                }, 15_000L)
                 return true
             }
 
@@ -429,6 +462,19 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 // A new navigation is under way — reset the offline-failure flag.
                 mainFrameFailedOffline = false
                 urlBar.setText(url)
+
+                // Desktop-mode zoom fix: WebView CARRIES the previous page's
+                // pinch-zoom level into the next page load (documented WebView
+                // behaviour — no public reset API). Toggling overview mode off
+                // and back on + initialScale(0) is the known way to force each
+                // new desktop page to re-fit to the screen instead of loading
+                // "zoomed in". Mobile pages reset naturally via their viewport
+                // meta, so this only runs in desktop mode.
+                if (isDesktopMode) {
+                    view?.settings?.loadWithOverviewMode = false
+                    view?.settings?.loadWithOverviewMode = true
+                    view?.setInitialScale(0)
+                }
             }
 
             // Issue 1: the old code injected a viewport meta with width=1100
