@@ -1,12 +1,15 @@
 package com.example
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.app.DownloadManager
-import android.content.Context
+import android.content.ClipData
+import android.content.ComponentCallbacks2
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
+import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -14,84 +17,154 @@ import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Message
 import android.os.Environment
 import android.os.Process
+import android.provider.MediaStore
 import android.util.Base64
+import android.view.Gravity
 import android.view.KeyEvent
-import android.view.ViewGroup
+import android.view.View
 import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
 import android.webkit.*
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.FileOutputStream
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
     private lateinit var webView: WebView
-    private lateinit var urlEditText: EditText
-    private lateinit var desktopButton: Button
+    private lateinit var urlBar: EditText
+    private lateinit var progressBar: ProgressBar
+    private lateinit var desktopBtn: Button
 
     private var isDesktopMode = false
+    private var defaultUserAgent: String = ""
+    private val desktopUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
-    private var pendingPermissionRequest: PermissionRequest? = null
+    private var cameraOutputUri: Uri? = null
 
-    private val FILE_CHOOSER_REQUEST_CODE = 1001
-    private val PERMISSION_REQUEST_CODE = 1002
+    private var pendingDownload: DownloadTask? = null
 
-    private var lastTargetUrl: String = "https://www.google.com"
-    private var hasNetworkError = false
-    private lateinit var connectivityManager: ConnectivityManager
-    private lateinit var networkCallback: ConnectivityManager.NetworkCallback
+    // --- Offline auto-recovery state (issue 3) ---
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var mainFrameFailedOffline = false
 
-    // Clean Chrome Mobile UA recognized by Google OAuth, AI Overview, and Google Lens
-    private val mobileUserAgent =
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+    data class DownloadTask(
+        val url: String,
+        val userAgent: String,
+        val contentDisposition: String,
+        val mimeType: String
+    )
 
-    // Clean Desktop Chrome UA
-    private val desktopUserAgent =
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val pickedUri = result.data?.data
+            if (pickedUri != null) {
+                fileUploadCallback?.onReceiveValue(arrayOf(pickedUri))
+                cameraOutputUri?.let { uri ->
+                    try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+                }
+            } else if (cameraOutputUri != null) {
+                val hasContent = try {
+                    contentResolver.openInputStream(cameraOutputUri!!)?.use { it.read() != -1 } ?: false
+                } catch (_: Exception) {
+                    false
+                }
+
+                if (hasContent) {
+                    fileUploadCallback?.onReceiveValue(arrayOf(cameraOutputUri!!))
+                } else {
+                    val thumb = result.data?.extras?.get("data") as? Bitmap
+                    if (thumb != null) {
+                        try {
+                            contentResolver.openOutputStream(cameraOutputUri!!)?.use { out ->
+                                thumb.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                            }
+                            fileUploadCallback?.onReceiveValue(arrayOf(cameraOutputUri!!))
+                        } catch (_: Exception) {
+                            fileUploadCallback?.onReceiveValue(null)
+                        }
+                    } else {
+                        fileUploadCallback?.onReceiveValue(null)
+                    }
+                }
+            } else {
+                val results = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                fileUploadCallback?.onReceiveValue(results)
+            }
+        } else {
+            cameraOutputUri?.let { uri ->
+                try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+            }
+            fileUploadCallback?.onReceiveValue(null)
+        }
+        fileUploadCallback = null
+        cameraOutputUri = null
+    }
+
+    private val blockedDomains = hashSetOf(
+        "doubleclick.net", "googlesyndication.com", "google-analytics.com",
+        "adservice.google.com", "facebook.net", "scorecardresearch.com",
+        "criteo.com", "taboola.com", "outbrain.com", "amazon-adsystem.com"
+    )
+
+    // Bridge for direct in-memory blob conversion
+    inner class BlobDownloadBridge {
+        @JavascriptInterface
+        fun processBlob(base64Data: String, mimeType: String) {
+            saveRawBase64(base64Data, mimeType)
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // fitsSystemWindows prevents system status bar from overlapping top bar
+        window.statusBarColor = Color.parseColor("#121212")
+        window.navigationBarColor = Color.BLACK
+
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
+            setBackgroundColor(Color.BLACK)
             fitsSystemWindows = true
         }
 
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            val paddingPx = (6 * resources.displayMetrics.density).toInt()
-            setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
+            setBackgroundColor(Color.parseColor("#121212"))
+            gravity = Gravity.CENTER_VERTICAL
         }
 
-        urlEditText = EditText(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f)
-            hint = "Search or type URL"
+        urlBar = EditText(this).apply {
+            setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_GO
-            isSingleLine = true
-            setSelectAllOnFocus(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            hint = "Search or type URL"
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
+            setPadding(28, 20, 28, 20)
+
+            setOnClickListener { setText("") }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) setText("")
+            }
+
             setOnEditorActionListener { _, actionId, event ->
                 if (actionId == EditorInfo.IME_ACTION_GO ||
-                    (event != null && event.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
+                    (event?.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
                 ) {
-                    val input = text.toString().trim()
-                    loadFormattedUrl(input)
-                    hideKeyboard()
+                    loadInput(text.toString())
+                    clearFocus()
                     true
                 } else {
                     false
@@ -99,370 +172,473 @@ class MainActivity : Activity() {
             }
         }
 
-        desktopButton = Button(this).apply {
-            text = "D"
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+        desktopBtn = Button(this).apply {
+            text = "DESK"
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(20, 0, 20, 0)
             setOnClickListener {
-                toggleDesktopMode()
+                isDesktopMode = !isDesktopMode
+                if (isDesktopMode) {
+                    webView.settings.userAgentString = desktopUserAgent
+                    webView.settings.useWideViewPort = true
+                    webView.settings.loadWithOverviewMode = true
+                    setTextColor(Color.CYAN)
+                } else {
+                    webView.settings.userAgentString = defaultUserAgent
+                    setTextColor(Color.GRAY)
+                }
+                webView.reload()
             }
         }
 
-        topBar.addView(urlEditText)
-        topBar.addView(desktopButton)
+        topBar.addView(urlBar, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        topBar.addView(desktopBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
+
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            visibility = View.GONE
+        }
 
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
-                1.0f
+                1f
             )
         }
 
         rootLayout.addView(topBar)
+        rootLayout.addView(progressBar)
         rootLayout.addView(webView)
         setContentView(rootLayout)
 
-        configureWebView()
-        setupNetworkAutoReconnect()
+        checkRequiredPermissions()
+        applyStrictEngineSettings()
+        registerNetworkRecovery()
+        webView.loadUrl("https://www.google.com")
+    }
 
-        loadFormattedUrl(lastTargetUrl)
+    private fun checkRequiredPermissions() {
+        val permissions = mutableListOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO
+        )
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            permissions.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            permissions.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        val needed = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (needed.isNotEmpty()) {
+            requestPermissions(needed.toTypedArray(), 101)
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun configureWebView() {
-        val settings = webView.settings
-        settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true
-        settings.databaseEnabled = true
-        settings.javaScriptCanOpenWindowsAutomatically = true
-        settings.mediaPlaybackRequiresUserGesture = false
+    private fun applyStrictEngineSettings() {
+        val s = webView.settings
 
-        // Viewport and layout overview settings
-        settings.useWideViewPort = true
-        settings.loadWithOverviewMode = true
-        settings.setSupportZoom(true)
-        settings.builtInZoomControls = true
-        settings.displayZoomControls = false
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = true
+        s.databaseEnabled = true
+        s.setSupportZoom(true)
+        s.builtInZoomControls = true
+        s.displayZoomControls = false
+        s.useWideViewPort = true
+        s.loadWithOverviewMode = true
 
-        settings.userAgentString = mobileUserAgent
+        // Issue 2: allow new-window navigations (Google SERP tabs such as
+        // "AI Mode" use target=_blank / window.open). Without multiple-window
+        // support the request is silently swallowed and the tap does nothing.
+        s.setSupportMultipleWindows(true)
+        s.javaScriptCanOpenWindowsAutomatically = true
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            CookieManager.getInstance().apply {
-                setAcceptCookie(true)
-                setAcceptThirdPartyCookies(webView, true)
-            }
-        }
+        defaultUserAgent = s.userAgentString
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                ServiceWorkerController.getInstance().serviceWorkerWebSettings.apply {
-                    allowContentAccess = true
-                    allowFileAccess = true
-                    blockNetworkLoads = false
-                }
-            } catch (_: Exception) {}
-        }
+        s.offscreenPreRaster = false
+        s.mediaPlaybackRequiresUserGesture = true
+        s.cacheMode = WebSettings.LOAD_NO_CACHE
 
-        webView.addJavascriptInterface(AndroidBlobBridge(), "AndroidBlobBridge")
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(true)
+        cookieManager.setAcceptThirdPartyCookies(webView, false)
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url?.toString() ?: return false
-                return if (url.startsWith("http://") || url.startsWith("https://")) {
-                    false
-                } else {
-                    try {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                        startActivity(intent)
-                        true
-                    } catch (e: Exception) {
-                        true
-                    }
-                }
-            }
-
-            override fun onReceivedError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                error: WebResourceError?
-            ) {
-                if (request?.isForMainFrame == true) {
-                    hasNetworkError = true
-                    val failedUrl = request.url.toString()
-                    if (!failedUrl.contains("chromewebdata")) {
-                        lastTargetUrl = failedUrl
-                    }
-                }
-            }
-
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                url?.let {
-                    if (!it.contains("chromewebdata")) {
-                        urlEditText.setText(it)
-                    }
-                }
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                if (url != null && !url.contains("chromewebdata")) {
-                    hasNetworkError = false
-                    lastTargetUrl = url
-                }
-
-                // In desktop mode, remove mobile viewport tags so desktop sites scale correctly
-                if (isDesktopMode) {
-                    val script = """
-                        (function() {
-                            var metas = document.querySelectorAll('meta[name="viewport"]');
-                            for (var i = 0; i < metas.length; i++) {
-                                metas[i].parentNode.removeChild(metas[i]);
-                            }
-                        })();
-                    """.trimIndent()
-                    view?.evaluateJavascript(script, null)
-                }
-            }
-        }
+        webView.addJavascriptInterface(BlobDownloadBridge(), "AndroidBlobBridge")
 
         webView.webChromeClient = object : WebChromeClient() {
-            // Fix: Handles Google Lens live camera and voice search permissions
-            override fun onPermissionRequest(request: PermissionRequest) {
-                runOnUiThread {
-                    val requestedResources = request.resources
-                    val permissionsNeeded = mutableListOf<String>()
-
-                    for (resource in requestedResources) {
-                        if (resource == PermissionRequest.RESOURCE_VIDEO_CAPTURE) {
-                            if (checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                                permissionsNeeded.add(android.Manifest.permission.CAMERA)
-                            }
-                        }
-                        if (resource == PermissionRequest.RESOURCE_AUDIO_CAPTURE) {
-                            if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                                permissionsNeeded.add(android.Manifest.permission.RECORD_AUDIO)
-                            }
-                        }
-                    }
-
-                    if (permissionsNeeded.isNotEmpty()) {
-                        pendingPermissionRequest = request
-                        requestPermissions(permissionsNeeded.toTypedArray(), PERMISSION_REQUEST_CODE)
-                    } else {
-                        request.grant(request.resources)
-                    }
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                if (newProgress < 100) {
+                    progressBar.visibility = View.VISIBLE
+                    progressBar.progress = newProgress
+                } else {
+                    progressBar.visibility = View.GONE
                 }
             }
 
-            // Fix: Handles file uploads and Google Lens image picker
-            override fun onShowFileChooser(
+            // Issue 2: single-window browser — route every new-window request
+            // (target=_blank, window.open — e.g. Google's "AI Mode" tab) into
+            // THIS WebView by handing the same view back via the transport.
+            // Reusing the existing view means zero extra RAM.
+            override fun onCreateWindow(
                 view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message?
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                if (transport == null || view == null || resultMsg == null) {
+                    return false // can't handle it — let WebView cancel the popup
+                }
+                transport.webView = view
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                runOnUiThread {
+                    request?.grant(request.resources)
+                }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
                 fileChooserParams: FileChooserParams?
             ): Boolean {
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
 
-                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                cameraOutputUri = try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Images.Media.TITLE, "IMG_${System.currentTimeMillis()}")
+                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    }
+                    contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                } catch (_: Exception) {
+                    null
+                }
+
+                val captureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                    if (cameraOutputUri != null) {
+                        putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri)
+                        clipData = ClipData.newUri(contentResolver, "photo", cameraOutputUri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    }
+                }
+
+                if (cameraOutputUri != null) {
+                    val resInfoList = packageManager.queryIntentActivities(captureIntent, PackageManager.MATCH_DEFAULT_ONLY)
+                    for (resolveInfo in resInfoList) {
+                        val pkg = resolveInfo.activityInfo.packageName
+                        grantUriPermission(pkg, cameraOutputUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                }
+
+                val contentIntent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
                     type = "*/*"
                     addCategory(Intent.CATEGORY_OPENABLE)
                 }
 
-                return try {
-                    startActivityForResult(intent, FILE_CHOOSER_REQUEST_CODE)
-                    true
-                } catch (e: Exception) {
-                    try {
-                        val fallback = Intent(Intent.ACTION_GET_CONTENT).apply {
-                            type = "*/*"
-                            addCategory(Intent.CATEGORY_OPENABLE)
-                        }
-                        startActivityForResult(fallback, FILE_CHOOSER_REQUEST_CODE)
-                        true
-                    } catch (ex: Exception) {
-                        fileUploadCallback?.onReceiveValue(null)
-                        fileUploadCallback = null
-                        false
+                val chooserIntent = Intent(Intent.ACTION_CHOOSER).apply {
+                    putExtra(Intent.EXTRA_INTENT, contentIntent)
+                    putExtra(Intent.EXTRA_TITLE, "Select Camera or File")
+                    if (captureIntent.resolveActivity(packageManager) != null) {
+                        putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf(captureIntent))
                     }
                 }
+
+                try {
+                    fileChooserLauncher.launch(chooserIntent)
+                } catch (_: Exception) {
+                    fileUploadCallback?.onReceiveValue(null)
+                    fileUploadCallback = null
+                    return false
+                }
+                return true
             }
         }
 
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
-            handleDownload(url, userAgent, contentDisposition, mimetype)
+            val task = DownloadTask(url, userAgent, contentDisposition, mimetype)
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+                checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+            ) {
+                pendingDownload = task
+                requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 102)
+                return@setDownloadListener
+            }
+            executeDownload(task)
         }
-    }
 
-    // Auto-detects data restore and automatically reloads without restarting the app
-    private fun setupNetworkAutoReconnect() {
-        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                // A new navigation is under way — reset the offline-failure flag.
+                mainFrameFailedOffline = false
+                urlBar.setText(url)
+            }
 
-        networkCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                runOnUiThread {
-                    if (hasNetworkError) {
-                        hasNetworkError = false
-                        webView.postDelayed({
-                            if (!isFinishing && !isDestroyed) {
-                                webView.loadUrl(lastTargetUrl)
-                            }
-                        }, 500)
+            // Issue 1: the old code injected a viewport meta with width=1100
+            // AFTER the page had already laid out and WebView had computed its
+            // initial fit-zoom. Changing the viewport post-layout never
+            // re-triggers the overview fit, so the page rendered wider than
+            // the screen and the user had to pinch-zoom out manually.
+            // Desktop mode is now driven purely by the desktop User-Agent +
+            // useWideViewPort + loadWithOverviewMode, which lets WebView size
+            // and fit the page correctly at load time.
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                var url = request?.url?.toString() ?: return false
+
+                if (isDesktopMode && url.contains("://m.")) {
+                    url = url.replace("://m.", "://www.")
+                    view?.loadUrl(url)
+                    return true
+                }
+
+                if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("about:blank")) {
+                    return false
+                }
+
+                try {
+                    val intent = if (url.startsWith("intent:")) {
+                        Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+                            // Never let a web page direct-launch a specific app
+                            // component through an intent:// link.
+                            component = null
+                        }
+                    } else {
+                        Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    }
+                    if (intent.resolveActivity(packageManager) != null) {
+                        startActivity(intent)
+                        return true
+                    }
+                    val fallback = intent.getStringExtra("browser_fallback_url")
+                    if (!fallback.isNullOrEmpty() && fallback.startsWith("http")) {
+                        view?.loadUrl(fallback)
+                        return true
+                    }
+                    // Issue 2: intent:// links carry the real https URL in their
+                    // data — recover it so navigations (e.g. Google AI Mode)
+                    // never die silently when no app can handle the intent.
+                    val embedded = intent.dataString
+                    if (embedded != null &&
+                        (embedded.startsWith("http://") || embedded.startsWith("https://"))
+                    ) {
+                        view?.loadUrl(embedded)
+                        return true
+                    }
+                } catch (_: Exception) {}
+                return true
+            }
+
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val url = request?.url ?: return null
+                val host = url.host ?: ""
+
+                if (blockedDomains.any { host.contains(it) }) {
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                }
+
+                return super.shouldInterceptRequest(view, request)
+            }
+
+            // Issue 3: remember when the main document itself failed with a
+            // connectivity-type error, so the network callback can retry once
+            // data comes back.
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame == true) {
+                    mainFrameFailedOffline = when (error?.errorCode) {
+                        WebViewClient.ERROR_HOST_LOOKUP,
+                        WebViewClient.ERROR_CONNECT,
+                        WebViewClient.ERROR_TIMEOUT,
+                        WebViewClient.ERROR_IO,
+                        WebViewClient.ERROR_UNKNOWN -> true
+                        else -> false
                     }
                 }
             }
         }
-        connectivityManager.registerNetworkCallback(request, networkCallback)
     }
 
-    private fun toggleDesktopMode() {
-        isDesktopMode = !isDesktopMode
-        desktopButton.text = if (isDesktopMode) "M" else "D"
-
-        val settings = webView.settings
-        settings.userAgentString = if (isDesktopMode) desktopUserAgent else mobileUserAgent
-        webView.setInitialScale(0)
-        webView.reload()
-    }
-
-    private fun loadFormattedUrl(input: String) {
-        val target = when {
-            input.startsWith("http://") || input.startsWith("https://") -> input
-            input.contains(".") && !input.contains(" ") -> "https://$input"
-            else -> "https://www.google.com/search?q=${Uri.encode(input)}"
+    // Issue 3: auto-recover from "webpage not available". Register a single
+    // system network callback (no polling, no threads of our own — effectively
+    // zero RAM). When a network becomes available and the last main-frame load
+    // failed with a connectivity error, reload once.
+    private fun registerNetworkRecovery() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                runOnUiThread {
+                    if (mainFrameFailedOffline && !isDestroyed) {
+                        mainFrameFailedOffline = false
+                        Toast.makeText(this@MainActivity, "Back online — reloading", Toast.LENGTH_SHORT).show()
+                        webView.reload()
+                    }
+                }
+            }
         }
-        lastTargetUrl = target
-        hasNetworkError = false
-        webView.loadUrl(target)
+        networkCallback = callback
+        cm.registerNetworkCallback(
+            NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build(),
+            callback
+        )
     }
 
-    private fun handleDownload(url: String, userAgent: String, contentDisposition: String, mimetype: String) {
+    private fun executeDownload(task: DownloadTask) {
+        val url = task.url
+
+        // Handle client-side Blob URLs (Google Flow, web video renderers)
         if (url.startsWith("blob:")) {
+            Toast.makeText(this, "Downloading video...", Toast.LENGTH_SHORT).show()
             val js = """
                 (function() {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', '$url', true);
-                    xhr.responseType = 'blob';
-                    xhr.onload = function() {
+                    fetch('$url')
+                    .then(response => response.blob())
+                    .then(blob => {
                         var reader = new FileReader();
-                        reader.readAsDataURL(xhr.response);
                         reader.onloadend = function() {
-                            window.AndroidBlobBridge.processBlobData(reader.result, '$mimetype');
+                            window.AndroidBlobBridge.processBlob(reader.result, blob.type);
                         };
-                    };
-                    xhr.send();
+                        reader.readAsDataURL(blob);
+                    })
+                    .catch(err => console.error(err));
                 })();
             """.trimIndent()
             webView.evaluateJavascript(js, null)
             return
         }
 
-        val request = DownloadManager.Request(Uri.parse(url)).apply {
-            setMimeType(mimetype)
-            addRequestHeader("User-Agent", userAgent)
-            setDescription("Downloading file...")
-            setTitle(URLUtil.guessFileName(url, contentDisposition, mimetype))
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalPublicDir(
-                Environment.DIRECTORY_DOWNLOADS,
-                URLUtil.guessFileName(url, contentDisposition, mimetype)
-            )
+        // Handle inline Data URIs
+        if (url.startsWith("data:")) {
+            saveRawBase64(url, task.mimeType)
+            return
         }
-        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        dm.enqueue(request)
-        Toast.makeText(this, "Download started", Toast.LENGTH_SHORT).show()
+
+        // Standard HTTP / HTTPS Downloads via DownloadManager
+        try {
+            val fileName = URLUtil.guessFileName(url, task.contentDisposition, task.mimeType)
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            downloadsDir.mkdirs()
+
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                if (task.mimeType.isNotEmpty()) {
+                    setMimeType(task.mimeType)
+                }
+                addRequestHeader("User-Agent", task.userAgent)
+                val cookies = CookieManager.getInstance().getCookie(url)
+                if (!cookies.isNullOrEmpty()) {
+                    addRequestHeader("Cookie", cookies)
+                }
+                addRequestHeader("Referer", webView.url ?: url)
+                setDescription("Downloading file...")
+                setTitle(fileName)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                @Suppress("DEPRECATION")
+                allowScanningByMediaScanner()
+            }
+
+            val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+            dm.enqueue(request)
+            Toast.makeText(this, "Download started: $fileName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 
-    inner class AndroidBlobBridge {
-        @JavascriptInterface
-        fun processBlobData(base64Data: String, mimeType: String) {
+    private fun saveRawBase64(dataUri: String, mimeTypeHint: String) {
+        Thread {
             try {
-                val pureBase64 = base64Data.substringAfter(",")
-                val fileBytes = Base64.decode(pureBase64, Base64.DEFAULT)
-                val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType) ?: "bin"
-                val file = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "blob_${System.currentTimeMillis()}.$ext"
-                )
-                FileOutputStream(file).use { it.write(fileBytes) }
-                runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Saved to Downloads", Toast.LENGTH_SHORT).show()
+                val commaIndex = dataUri.indexOf(",")
+                if (commaIndex != -1) {
+                    val header = dataUri.substring(0, commaIndex)
+                    val rawBase64 = dataUri.substring(commaIndex + 1)
+                    val bytes = Base64.decode(rawBase64, Base64.DEFAULT)
+
+                    val extension = when {
+                        header.contains("video/mp4") || mimeTypeHint.contains("video/mp4") -> ".mp4"
+                        header.contains("video/webm") || mimeTypeHint.contains("video/webm") -> ".webm"
+                        header.contains("image/png") -> ".png"
+                        header.contains("image/jpeg") || header.contains("image/jpg") -> ".jpg"
+                        header.contains("image/webp") -> ".webp"
+                        header.contains("application/pdf") -> ".pdf"
+                        else -> ".mp4"
+                    }
+
+                    val fileName = "Flow_Video_${System.currentTimeMillis()}$extension"
+                    val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    downloadsDir.mkdirs()
+                    val targetFile = File(downloadsDir, fileName)
+
+                    targetFile.outputStream().use { it.write(bytes) }
+
+                    MediaScannerConnection.scanFile(
+                        this@MainActivity,
+                        arrayOf(targetFile.absolutePath),
+                        arrayOf("video/mp4"),
+                        null
+                    )
+
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Saved to Downloads: $fileName", Toast.LENGTH_LONG).show()
+                    }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Blob export failed", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
-        }
+        }.start()
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_REQUEST_CODE) {
-            val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-            if (granted) {
-                pendingPermissionRequest?.grant(pendingPermissionRequest?.resources)
-            } else {
-                pendingPermissionRequest?.deny()
+        if (requestCode == 102 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            pendingDownload?.let {
+                executeDownload(it)
+                pendingDownload = null
             }
-            pendingPermissionRequest = null
         }
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
-            if (fileUploadCallback == null) return
-
-            var results: Array<Uri>? = null
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                results = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
-                if (results == null || results.isEmpty()) {
-                    val clipData = data.clipData
-                    if (clipData != null && clipData.itemCount > 0) {
-                        val uriList = ArrayList<Uri>()
-                        for (i in 0 until clipData.itemCount) {
-                            uriList.add(clipData.getItemAt(i).uri)
-                        }
-                        results = uriList.toTypedArray()
-                    } else {
-                        data.data?.let { uri ->
-                            results = arrayOf(uri)
-                        }
-                    }
-                }
-            }
-
-            fileUploadCallback?.onReceiveValue(results)
-            fileUploadCallback = null
+    private fun loadInput(input: String) {
+        val clean = input.trim()
+        val target = when {
+            clean.startsWith("http://") || clean.startsWith("https://") -> clean
+            clean.contains(".") && !clean.contains(" ") -> "https://$clean"
+            else -> "https://www.google.com/search?q=" + Uri.encode(clean)
         }
-    }
-
-    private fun hideKeyboard() {
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(urlEditText.windowToken, 0)
-    }
-
-    // Battery optimization: pause timers and animations when screen off or minimized
-    override fun onPause() {
-        super.onPause()
-        webView.onPause()
-        webView.pauseTimers()
+        webView.loadUrl(target)
     }
 
     override fun onResume() {
         super.onResume()
         webView.onResume()
         webView.resumeTimers()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        webView.onPause()
+        webView.pauseTimers()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            webView.clearCache(true)
+            System.gc()
+        }
     }
 
     override fun onBackPressed() {
@@ -474,22 +650,52 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        try {
-            connectivityManager.unregisterNetworkCallback(networkCallback)
-        } catch (_: Exception) {}
+        networkCallback?.let {
+            try {
+                getSystemService(ConnectivityManager::class.java)
+                    ?.unregisterNetworkCallback(it)
+            } catch (_: Exception) {
+            }
+        }
+        networkCallback = null
 
-        fileUploadCallback?.onReceiveValue(null)
-        fileUploadCallback = null
-        pendingPermissionRequest?.deny()
-        pendingPermissionRequest = null
-
-        // 0.00 B cache footprint on clean exit
-        webView.stopLoading()
-        webView.clearHistory()
         webView.clearCache(true)
+        webView.clearFormData()
+        webView.clearHistory()
         webView.destroy()
-        cacheDir.deleteRecursively()
+
+        cleanDir(cacheDir)
+        cleanDir(codeCacheDir)
+        externalCacheDir?.let { cleanDir(it) }
+
+        val webviewDir = File(applicationInfo.dataDir, "app_webview")
+        if (webviewDir.exists()) {
+            cleanChromiumCache(webviewDir)
+        }
+
         super.onDestroy()
         Process.killProcess(Process.myPid())
+    }
+
+    private fun cleanDir(dir: File?) {
+        if (dir != null && dir.isDirectory) {
+            dir.listFiles()?.forEach { file ->
+                if (file.isDirectory) cleanDir(file)
+                file.delete()
+            }
+        }
+    }
+
+    private fun cleanChromiumCache(dir: File) {
+        val targets = listOf("Cache", "Code Cache", "GPUCache", "Service Worker")
+        dir.listFiles()?.forEach { file ->
+            if (file.isDirectory) {
+                if (targets.any { file.name.contains(it, ignoreCase = true) }) {
+                    file.deleteRecursively()
+                } else {
+                    cleanChromiumCache(file)
+                }
+            }
+        }
     }
 }
