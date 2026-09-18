@@ -36,6 +36,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
@@ -57,6 +58,13 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var mainFrameFailedOffline = false
 
+    // --- New-window capture (issue 2) ---
+    private var popupCaptureWebView: WebView? = null
+
+    // --- Chunked blob download state (corrupted-download fix) ---
+    private var blobOutputStream: FileOutputStream? = null
+    private var blobTempFile: File? = null
+
     data class DownloadTask(
         val url: String,
         val userAgent: String,
@@ -68,7 +76,8 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
-            val pickedUri = result.data?.data
+            val data = result.data
+            val pickedUri = data?.data ?: data?.clipData?.getItemAt(0)?.uri
             if (pickedUri != null) {
                 fileUploadCallback?.onReceiveValue(arrayOf(pickedUri))
                 cameraOutputUri?.let { uri ->
@@ -118,11 +127,18 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         "criteo.com", "taboola.com", "outbrain.com", "amazon-adsystem.com"
     )
 
-    // Bridge for direct in-memory blob conversion
+    // Bridge for CHUNKED blob → file streaming. The old single-shot base64
+    // transfer corrupted large files (multi-MB MP4 renders from Google Flow)
+    // because of string-size limits on the JS→Java bridge.
     inner class BlobDownloadBridge {
         @JavascriptInterface
-        fun processBlob(base64Data: String, mimeType: String) {
-            saveRawBase64(base64Data, mimeType)
+        fun processBlobChunk(base64Chunk: String, mimeType: String, offset: Long, totalSize: Long) {
+            handleBlobChunk(base64Chunk, mimeType, offset, totalSize)
+        }
+
+        @JavascriptInterface
+        fun finishBlob(mimeType: String, totalSize: Long) {
+            finishBlobDownload(mimeType, totalSize)
         }
     }
 
@@ -276,10 +292,13 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 }
             }
 
-            // Issue 2: single-window browser — route every new-window request
-            // (target=_blank, window.open — e.g. Google's "AI Mode" tab) into
-            // THIS WebView by handing the same view back via the transport.
-            // Reusing the existing view means zero extra RAM.
+            // Issue 2: Google's SERP tabs (e.g. "AI Mode") open via
+            // target=_blank / window.open. Handing THIS WebView back through
+            // the transport renders a blank/black page on modern WebView
+            // builds, so instead we give WebView a throwaway hidden WebView
+            // whose only job is to capture the target URL, then load that URL
+            // into the main WebView. The temp view is destroyed right away,
+            // so the memory cost is a few MB for a fraction of a second.
             override fun onCreateWindow(
                 view: WebView?,
                 isDialog: Boolean,
@@ -288,9 +307,28 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             ): Boolean {
                 val transport = resultMsg?.obj as? WebView.WebViewTransport
                 if (transport == null || view == null || resultMsg == null) {
-                    return false // can't handle it — let WebView cancel the popup
+                    return false
                 }
-                transport.webView = view
+
+                try { popupCaptureWebView?.destroy() } catch (_: Exception) {}
+                val temp = WebView(view.context)
+                var captured = false
+                temp.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
+                        val target = request?.url?.toString() ?: return true
+                        if (!captured && (target.startsWith("http://") || target.startsWith("https://"))) {
+                            captured = true
+                            view.loadUrl(target)
+                            v?.post {
+                                try { v.destroy() } catch (_: Exception) {}
+                                if (popupCaptureWebView === v) popupCaptureWebView = null
+                            }
+                        }
+                        return true // the temp view must never actually load anything
+                    }
+                }
+                popupCaptureWebView = temp
+                transport.webView = temp
                 resultMsg.sendToTarget()
                 return true
             }
@@ -309,30 +347,24 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
 
-                cameraOutputUri = try {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Images.Media.TITLE, "IMG_${System.currentTimeMillis()}")
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                    }
-                    contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                val captureRequested = try {
+                    fileChooserParams?.isCaptureEnabled == true
                 } catch (_: Exception) {
+                    false
+                }
+
+                cameraOutputUri = if (captureRequested) {
+                    try {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Images.Media.TITLE, "IMG_${System.currentTimeMillis()}")
+                            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                        }
+                        contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    } catch (_: Exception) {
+                        null
+                    }
+                } else {
                     null
-                }
-
-                val captureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
-                    if (cameraOutputUri != null) {
-                        putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri)
-                        clipData = ClipData.newUri(contentResolver, "photo", cameraOutputUri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                    }
-                }
-
-                if (cameraOutputUri != null) {
-                    val resInfoList = packageManager.queryIntentActivities(captureIntent, PackageManager.MATCH_DEFAULT_ONLY)
-                    for (resolveInfo in resInfoList) {
-                        val pkg = resolveInfo.activityInfo.packageName
-                        grantUriPermission(pkg, cameraOutputUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
                 }
 
                 val contentIntent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
@@ -340,16 +372,36 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     addCategory(Intent.CATEGORY_OPENABLE)
                 }
 
-                val chooserIntent = Intent(Intent.ACTION_CHOOSER).apply {
+                // NOTE: the camera is deliberately NOT injected into the chooser
+                // via EXTRA_INITIAL_INTENTS anymore. Mixing ACTION_IMAGE_CAPTURE
+                // into a chooser's initial intents breaks the returned result on
+                // many Android 11+ devices — the picked file never reaches the
+                // page and the site re-shows its upload menu. The camera is now
+                // used only when the site explicitly requests capture
+                // (<input type="file" capture>).
+                var launchIntent = Intent(Intent.ACTION_CHOOSER).apply {
                     putExtra(Intent.EXTRA_INTENT, contentIntent)
-                    putExtra(Intent.EXTRA_TITLE, "Select Camera or File")
+                    putExtra(Intent.EXTRA_TITLE, "Select file")
+                }
+
+                if (captureRequested && cameraOutputUri != null) {
+                    val captureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                        putExtra(MediaStore.EXTRA_OUTPUT, cameraOutputUri)
+                        clipData = ClipData.newUri(contentResolver, "photo", cameraOutputUri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    }
                     if (captureIntent.resolveActivity(packageManager) != null) {
-                        putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf(captureIntent))
+                        val resInfoList = packageManager.queryIntentActivities(captureIntent, PackageManager.MATCH_DEFAULT_ONLY)
+                        for (resolveInfo in resInfoList) {
+                            val pkg = resolveInfo.activityInfo.packageName
+                            grantUriPermission(pkg, cameraOutputUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        launchIntent = captureIntent
                     }
                 }
 
                 try {
-                    fileChooserLauncher.launch(chooserIntent)
+                    fileChooserLauncher.launch(launchIntent)
                 } catch (_: Exception) {
                     fileUploadCallback?.onReceiveValue(null)
                     fileUploadCallback = null
@@ -497,21 +549,41 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private fun executeDownload(task: DownloadTask) {
         val url = task.url
 
-        // Handle client-side Blob URLs (Google Flow, web video renderers)
+        // Handle client-side Blob URLs (Google Flow, web video renderers).
+        // Chunked transfer: the old single-shot base64 string corrupted
+        // large files (JS→Java bridge string-size limit).
         if (url.startsWith("blob:")) {
-            Toast.makeText(this, "Downloading video...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Downloading...", Toast.LENGTH_SHORT).show()
             val js = """
                 (function() {
                     fetch('$url')
-                    .then(response => response.blob())
-                    .then(blob => {
-                        var reader = new FileReader();
-                        reader.onloadend = function() {
-                            window.AndroidBlobBridge.processBlob(reader.result, blob.type);
-                        };
-                        reader.readAsDataURL(blob);
+                    .then(function(response) { return response.blob(); })
+                    .then(function(blob) {
+                        var CHUNK = 262144;
+                        var mime = blob.type;
+                        var size = blob.size;
+                        var offset = 0;
+                        function next() {
+                            var slice = blob.slice(offset, offset + CHUNK);
+                            var reader = new FileReader();
+                            reader.onloadend = function() {
+                                if (reader.readyState === FileReader.DONE) {
+                                    var s = reader.result;
+                                    var b64 = s.substring(s.indexOf(',') + 1);
+                                    window.AndroidBlobBridge.processBlobChunk(b64, mime, offset, size);
+                                    offset += CHUNK;
+                                    if (offset < size) {
+                                        setTimeout(next, 0);
+                                    } else {
+                                        window.AndroidBlobBridge.finishBlob(mime, size);
+                                    }
+                                }
+                            };
+                            reader.readAsDataURL(slice);
+                        }
+                        if (size > 0) { next(); } else { window.AndroidBlobBridge.finishBlob(mime, 0); }
                     })
-                    .catch(err => console.error(err));
+                    .catch(function(err) { console.error(err); });
                 })();
             """.trimIndent()
             webView.evaluateJavascript(js, null)
@@ -554,6 +626,89 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         } catch (e: Exception) {
             Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    // ---- Chunked blob download (corrupted-file fix) ----
+    // Chunks arrive sequentially from the page's single JS thread, so plain
+    // append-writes are safe. Peak memory stays flat (one 256KB chunk at a
+    // time) instead of holding the whole file in RAM as base64 + bytes.
+    private fun handleBlobChunk(base64Chunk: String, mimeType: String, offset: Long, totalSize: Long) {
+        try {
+            if (offset == 0L) {
+                closeBlobStream()
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                downloadsDir.mkdirs()
+                // Clean up stale .part files abandoned by interrupted downloads
+                try {
+                    downloadsDir.listFiles { f ->
+                        f.name.endsWith(".part") && f.lastModified() < System.currentTimeMillis() - 3_600_000L
+                    }?.forEach { it.delete() }
+                } catch (_: Exception) {}
+                val f = File(downloadsDir, "Flow_Video_${System.currentTimeMillis()}.part")
+                blobTempFile = f
+                blobOutputStream = f.outputStream()
+            }
+            val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+            blobOutputStream?.write(bytes)
+        } catch (e: Exception) {
+            closeBlobStream()
+            blobTempFile?.delete()
+            blobTempFile = null
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun finishBlobDownload(mimeType: String, totalSize: Long) {
+        try {
+            closeBlobStream()
+            val part = blobTempFile
+            if (part == null || !part.exists() || part.length() == 0L) {
+                part?.delete()
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Save failed: no data received", Toast.LENGTH_SHORT).show()
+                }
+                return
+            }
+            val ext = when {
+                mimeType.contains("video/webm") -> ".webm"
+                mimeType.contains("video/mp4") || mimeType.contains("video/quicktime") -> ".mp4"
+                mimeType.contains("image/png") -> ".png"
+                mimeType.contains("image/jpeg") || mimeType.contains("image/jpg") -> ".jpg"
+                mimeType.contains("image/webp") -> ".webp"
+                mimeType.contains("application/pdf") -> ".pdf"
+                mimeType.contains("audio/") -> ".m4a"
+                else -> ".mp4"
+            }
+            val finalFile = File(part.parentFile, part.nameWithoutExtension + ext)
+            if (!part.renameTo(finalFile)) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Saved to Downloads: ${part.name}", Toast.LENGTH_LONG).show()
+                }
+                return
+            }
+            MediaScannerConnection.scanFile(
+                this,
+                arrayOf(finalFile.absolutePath),
+                arrayOf(mimeType.ifEmpty { "video/mp4" }),
+                null
+            )
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Saved to Downloads: ${finalFile.name}", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        } finally {
+            blobTempFile = null
+        }
+    }
+
+    private fun closeBlobStream() {
+        try { blobOutputStream?.close() } catch (_: Exception) {}
+        blobOutputStream = null
     }
 
     private fun saveRawBase64(dataUri: String, mimeTypeHint: String) {
@@ -658,6 +813,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             }
         }
         networkCallback = null
+
+        closeBlobStream()
+        try { popupCaptureWebView?.destroy() } catch (_: Exception) {}
+        popupCaptureWebView = null
 
         webView.clearCache(true)
         webView.clearFormData()
