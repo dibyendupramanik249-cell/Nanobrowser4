@@ -279,7 +279,16 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
         s.offscreenPreRaster = false
         s.mediaPlaybackRequiresUserGesture = true
-        s.cacheMode = WebSettings.LOAD_NO_CACHE
+
+        // Session HTTP cache (user-approved): the cache lives on DISK, so the
+        // RAM footprint is only a small in-memory index (well under 1 MB) —
+        // the renderer, the trim-purge and the exit-wipe all stay unchanged.
+        // Why: Google's mobile AI Mode ships a heavy JS bundle; with
+        // LOAD_NO_CACHE every entry re-downloaded it (the 2-5s black page).
+        // With LOAD_DEFAULT, the first entry of a session pays the download
+        // once and every following entry loads it from disk. The exit-wipe
+        // in onDestroy still erases everything when the browser closes.
+        s.cacheMode = WebSettings.LOAD_DEFAULT
 
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
@@ -295,27 +304,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 } else {
                     progressBar.visibility = View.GONE
                 }
-            }
-
-            // --- Visible diagnostics (kept for real page errors) ---
-            // Page console errors are surfaced as Toasts so we can see WHY a
-            // button does nothing without needing logcat. Ad-blocker noise
-            // (CORS failures on blocked domains, empty-response codes) is
-            // filtered out — those are EXPECTED, not bugs.
-            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                val cm = consoleMessage ?: return super.onConsoleMessage(consoleMessage)
-                val msg = cm.message() ?: ""
-                if (cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR &&
-                    !msg.contains("ERR_BLOCKED_BY_CLIENT") &&
-                    !msg.contains("ERR_EMPTY_RESPONSE") &&
-                    !msg.contains("ERR_INVALID_RESPONSE") &&
-                    !msg.contains("Access to XMLHttpRequest") &&
-                    !blockedDomains.any { msg.contains(it, ignoreCase = true) }
-                ) {
-                    val short = if (msg.length > 90) msg.substring(0, 90) + "…" else msg
-                    Toast.makeText(applicationContext, "JS error: $short", Toast.LENGTH_LONG).show()
-                }
-                return super.onConsoleMessage(consoleMessage)
             }
 
             // Issue 2: Google's SERP tabs (e.g. "AI Mode") open via
@@ -361,7 +349,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                         }
                         if (!captured && (target.startsWith("http://") || target.startsWith("https://"))) {
                             captured = true
-                            view.loadUrl(target)
+                            view.loadUrl(normalizeAiModeUrl(target))
                             v?.post {
                                 try { v.destroy() } catch (_: Exception) {}
                                 if (popupCaptureWebView === v) popupCaptureWebView = null
@@ -378,7 +366,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                             (url.startsWith("http://") || url.startsWith("https://"))
                         ) {
                             captured = true
-                            view.loadUrl(url)
+                            view.loadUrl(normalizeAiModeUrl(url))
                             v?.post {
                                 try { v.destroy() } catch (_: Exception) {}
                                 if (popupCaptureWebView === v) popupCaptureWebView = null
@@ -639,6 +627,30 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     }
                 }
             }
+        }
+    }
+
+    // AI Overview → AI Mode popups carry a heavy "continuation" URL — session
+    // tokens tying the new view to the Overview conversation. Google's backend
+    // STALLS the first answer-stream for such continuation URLs (the 2-5 minute
+    // black page), while the CLEAN search URL (?q=...&udm=50) loads fast
+    // (user-verified: the AI Mode tab bar and direct google.com/ai are always
+    // fast, and both of those also go through the same popup capture). So when
+    // a popup targets AI Mode, rebuild the clean URL for the same query —
+    // same answer, no stall, and back-navigation still works. Non-AI-Mode
+    // popups are captured untouched.
+    private fun normalizeAiModeUrl(url: String): String {
+        return try {
+            val u = Uri.parse(url)
+            if (u.getQueryParameter("udm") == "50") {
+                val q = u.getQueryParameter("q")
+                if (!q.isNullOrEmpty()) {
+                    return "https://www.google.com/search?q=" + Uri.encode(q) + "&udm=50"
+                }
+            }
+            url
+        } catch (_: Exception) {
+            url
         }
     }
 
