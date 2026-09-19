@@ -246,9 +246,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private fun checkRequiredPermissions() {
         val permissions = mutableListOf(
             android.Manifest.permission.CAMERA,
-            android.Manifest.permission.RECORD_AUDIO,
-            android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION
+            android.Manifest.permission.RECORD_AUDIO
         )
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             permissions.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -400,22 +398,17 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 }
             }
 
-            // Location integration (AI Overview fix candidate + general browser
-            // health): the DEFAULT onGeolocationPermissionsShowPrompt never
-            // answers the page at all, so any site awaiting navigator.geolocation
-            // hangs forever — including JS that runs before opening a new view
-            // (e.g. Google's AI Overview → "AI Mode" continuation). ALWAYS
-            // answer: grant if the app holds the runtime location permission,
-            // deny cleanly otherwise. Denying instantly is fine — the page's
-            // promise settles and its script continues either way.
+            // Geolocation: the app holds NO location permissions (removed at
+            // the user's request) — but we still ANSWER the page instantly
+            // with a denial. The DEFAULT implementation never answers at all,
+            // which hangs any site that awaits navigator.geolocation forever.
+            // An instant "denied" lets the page's promise settle and its
+            // scripts continue normally.
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String?,
                 callback: GeolocationPermissions.Callback?
             ) {
-                val hasLocation =
-                    checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
-                    checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-                callback?.invoke(origin, hasLocation, false)
+                callback?.invoke(origin, false, false)
             }
 
             override fun onShowFileChooser(
