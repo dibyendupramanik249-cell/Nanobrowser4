@@ -65,6 +65,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private var watchdogAttempts = 0
     private var watchdogUrl: String? = null
 
+    // --- Bounded session cache (v16) ---
+    private val cacheBudgetBytes = 20L * 1024 * 1024 // 20 MB cap
+    @Volatile private var cacheCheckBusy = false
+
     // --- New-window capture (issue 2) ---
     private var popupCaptureWebView: WebView? = null
 
@@ -532,6 +536,9 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 scheduleBlankWatchdog(url)
+                // Bound the on-disk cache footprint (v16): measure quietly on
+                // a background thread after every page load; flush if too big.
+                checkCacheBudget()
                 // Proactive render kick: Google pages (especially AI Mode) can
                 // freeze right after loading — a brief pause/resume ~1.5s in
                 // prevents the user having to press Recents to unfreeze them.
@@ -733,6 +740,45 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 } catch (_: Exception) {}
             }, 120L)
         } catch (_: Exception) {}
+    }
+
+    // ---- Bounded session cache (v16) ----
+    // The LOAD_DEFAULT session cache (v10) makes repeat AI Mode / site loads
+    // fast, but it collects data on disk with no system-side size limit —
+    // the user watched it grow in App Info. So: after each page load, measure
+    // our full on-disk footprint on a background thread; above 20 MB, flush
+    // the WebView cache. Cookies/login are untouched (clearCache only purges
+    // cached resources). The exit-wipe still erases everything on close.
+    private fun checkCacheBudget() {
+        if (cacheCheckBusy) return
+        cacheCheckBusy = true
+        Thread {
+            try {
+                val dirs = mutableListOf<File>(cacheDir, codeCacheDir)
+                externalCacheDir?.let { dirs.add(it) }
+                val webviewDir = File(applicationInfo.dataDir, "app_webview")
+                if (webviewDir.isDirectory) dirs.add(webviewDir)
+                var total = 0L
+                for (d in dirs) total += dirSize(d)
+                if (total > cacheBudgetBytes) {
+                    runOnUiThread {
+                        try { webView.clearCache(true) } catch (_: Exception) {}
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                cacheCheckBusy = false
+            }
+        }.start()
+    }
+
+    private fun dirSize(dir: File?): Long {
+        if (dir == null || !dir.exists()) return 0L
+        var size = 0L
+        dir.listFiles()?.forEach {
+            size += if (it.isDirectory) dirSize(it) else it.length()
+        }
+        return size
     }
 
     private fun scheduleBlankWatchdog(url: String?) {
