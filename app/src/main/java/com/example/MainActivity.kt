@@ -297,17 +297,20 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 }
             }
 
-            // --- Visible diagnostics (temporary, for the AI Overview issue) ---
+            // --- Visible diagnostics (kept for real page errors) ---
             // Page console errors are surfaced as Toasts so we can see WHY a
-            // button does nothing without needing logcat. Noise from the
-            // ad-blocker's empty responses is filtered out.
+            // button does nothing without needing logcat. Ad-blocker noise
+            // (CORS failures on blocked domains, empty-response codes) is
+            // filtered out — those are EXPECTED, not bugs.
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                 val cm = consoleMessage ?: return super.onConsoleMessage(consoleMessage)
                 val msg = cm.message() ?: ""
                 if (cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR &&
                     !msg.contains("ERR_BLOCKED_BY_CLIENT") &&
                     !msg.contains("ERR_EMPTY_RESPONSE") &&
-                    !msg.contains("ERR_INVALID_RESPONSE")
+                    !msg.contains("ERR_INVALID_RESPONSE") &&
+                    !msg.contains("Access to XMLHttpRequest") &&
+                    !blockedDomains.any { msg.contains(it, ignoreCase = true) }
                 ) {
                     val short = if (msg.length > 90) msg.substring(0, 90) + "…" else msg
                     Toast.makeText(applicationContext, "JS error: $short", Toast.LENGTH_LONG).show()
@@ -345,9 +348,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 temp.settings.cacheMode = WebSettings.LOAD_NO_CACHE
                 temp.settings.userAgentString = if (isDesktopMode) desktopUserAgent else defaultUserAgent
                 CookieManager.getInstance().setAcceptThirdPartyCookies(temp, false)
-                runOnUiThread {
-                    Toast.makeText(applicationContext, "• popup opened", Toast.LENGTH_SHORT).show()
-                }
                 var captured = false
                 temp.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
@@ -361,9 +361,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                         }
                         if (!captured && (target.startsWith("http://") || target.startsWith("https://"))) {
                             captured = true
-                            runOnUiThread {
-                                Toast.makeText(applicationContext, "• popup → $target", Toast.LENGTH_SHORT).show()
-                            }
                             view.loadUrl(target)
                             v?.post {
                                 try { v.destroy() } catch (_: Exception) {}
@@ -381,9 +378,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                             (url.startsWith("http://") || url.startsWith("https://"))
                         ) {
                             captured = true
-                            runOnUiThread {
-                                Toast.makeText(applicationContext, "• popup → $url", Toast.LENGTH_SHORT).show()
-                            }
                             view.loadUrl(url)
                             v?.post {
                                 try { v.destroy() } catch (_: Exception) {}
@@ -597,7 +591,15 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 val host = url.host ?: ""
 
                 if (blockedDomains.any { host.contains(it) }) {
-                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    // Empty 200 + permissive CORS: pages XHR these ad endpoints
+                    // cross-origin. A CORS-less empty response makes every such
+                    // XHR FAIL — console errors, retry loops, slow page init
+                    // (seen on mobile AI Mode). With ACAO:* the request
+                    // "succeeds" instantly with an empty body and the page's
+                    // scripts move on without stalling.
+                    return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0))).apply {
+                        responseHeaders = mapOf("Access-Control-Allow-Origin" to "*")
+                    }
                 }
 
                 // Desktop mode: responsive sites choose mobile/desktop layout by
