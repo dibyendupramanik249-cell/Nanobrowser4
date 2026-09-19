@@ -61,6 +61,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var mainFrameFailedOffline = false
 
+    // --- Blank-page watchdog state (v12) ---
+    private var watchdogAttempts = 0
+    private var watchdogUrl: String? = null
+
     // --- New-window capture (issue 2) ---
     private var popupCaptureWebView: WebView? = null
 
@@ -504,6 +508,8 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 // A new navigation is under way — reset the offline-failure flag.
                 mainFrameFailedOffline = false
                 urlBar.setText(url)
+                // Blank-page watchdog (v12): arm the recovery check.
+                scheduleBlankWatchdog(url)
 
                 // Desktop-mode zoom fix: WebView CARRIES the previous page's
                 // pinch-zoom level into the next page load (documented WebView
@@ -516,6 +522,20 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     view?.settings?.loadWithOverviewMode = false
                     view?.settings?.loadWithOverviewMode = true
                     view?.setInitialScale(0)
+                }
+            }
+
+            // Re-arm the blank-page watchdog AFTER the page reports finished —
+            // the blank hang can happen after a successful load event (the page
+            // paints only its loading spinner and then never renders).
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                scheduleBlankWatchdog(url)
+                // Proactive render kick: Google pages (especially AI Mode) can
+                // freeze right after loading — a brief pause/resume ~1.5s in
+                // prevents the user having to press Recents to unfreeze them.
+                if (url != null && url.contains("google.com/search")) {
+                    webView.postDelayed({ if (webView.url == url) kickRenderer() }, 1_500L)
                 }
             }
 
@@ -652,6 +672,76 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         } catch (_: Exception) {
             url
         }
+    }
+
+    // ---- Blank-page watchdog (v12) ----
+    // User-recorded bug: a Google search page downloaded everything but never
+    // rendered — blank screen with Google's small spinner for minutes, network
+    // idle (0.00 KB/s). The exact trigger varies (stale cache entry from the
+    // session cache, a stalled in-page view transition, a Google flake), so
+    // instead of guessing: RECOVER. 12s after a google.com/search page starts
+    // (re-armed after it finishes), if the view has no scrollable content at
+    // all — a real results page ALWAYS scrolls — recover it. Max 2 attempts
+    // per URL, so it can never loop.
+    private val blankCheckRunnable = object : Runnable {
+        override fun run() {
+            val url = webView.url ?: return
+            if (url.contains("google.com/search") &&
+                !webView.canScrollVertically(1) &&
+                !webView.canScrollVertically(-1) &&
+                watchdogAttempts < 2
+            ) {
+                watchdogAttempts++
+                // Step 1: render-kick — the user-verified cure (pausing and
+                // resuming the app unfreezes the page without reloading it).
+                kickRenderer()
+                // Step 2: if STILL blank 6s later, reload with the network
+                // cache bypassed.
+                webView.postDelayed({
+                    if (webView.url == url &&
+                        !webView.canScrollVertically(1) &&
+                        !webView.canScrollVertically(-1)
+                    ) {
+                        Toast.makeText(applicationContext, "Page appeared blank — retrying", Toast.LENGTH_SHORT).show()
+                        val oldMode = webView.settings.cacheMode
+                        webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                        webView.reload()
+                        webView.postDelayed({
+                            if (webView.settings.cacheMode == WebSettings.LOAD_NO_CACHE) {
+                                webView.settings.cacheMode = oldMode
+                            }
+                        }, 8_000L)
+                    }
+                }, 6_000L)
+            }
+        }
+    }
+
+    // Reproduces the user's verified cure programmatically: pause the WebView
+    // for ~120ms and resume it. This is the standard workaround for the Chromium
+    // WebView compositor stall where a loaded page stops repainting entirely
+    // (frozen spinner, no animation, network idle) until the app is backgrounded
+    // and foregrounded (pressing Recents and returning).
+    private fun kickRenderer() {
+        try {
+            webView.onPause()
+            webView.postDelayed({
+                try {
+                    webView.onResume()
+                    webView.invalidate()
+                } catch (_: Exception) {}
+            }, 120L)
+        } catch (_: Exception) {}
+    }
+
+    private fun scheduleBlankWatchdog(url: String?) {
+        webView.removeCallbacks(blankCheckRunnable)
+        if (url == null || !url.contains("google.com/search")) return
+        if (watchdogUrl != url) {
+            watchdogUrl = url
+            watchdogAttempts = 0
+        }
+        webView.postDelayed(blankCheckRunnable, 12_000L)
     }
 
     // Issue 3: auto-recover from "webpage not available". Register a single
@@ -1035,6 +1125,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         }
         networkCallback = null
 
+        webView.removeCallbacks(blankCheckRunnable)
         closeBlobStream()
         try { popupCaptureWebView?.destroy() } catch (_: Exception) {}
         popupCaptureWebView = null
