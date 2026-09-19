@@ -131,7 +131,15 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     private val blockedDomains = hashSetOf(
         "doubleclick.net", "googlesyndication.com", "google-analytics.com",
         "adservice.google.com", "facebook.net", "scorecardresearch.com",
-        "criteo.com", "taboola.com", "outbrain.com", "amazon-adsystem.com"
+        "criteo.com", "taboola.com", "outbrain.com", "amazon-adsystem.com",
+        // v15: major ad exchanges / DSPs / verification / analytics — every
+        // blocked resource is one the renderer never has to download, decode
+        // or hold in memory.
+        "adnxs.com", "adform.net", "adsrvr.org", "pubmatic.com",
+        "rubiconproject.com", "openx.net", "smartadserver.com",
+        "moatads.com", "adsafeprotected.com", "quantserve.com",
+        "hotjar.com", "clarity.ms", "chartbeat.com", "mixpanel.com",
+        "amplitude.com"
     )
 
     // Bridge for CHUNKED blob → file streaming. The old single-shot base64
@@ -1094,7 +1102,12 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+        // Purge from RUNNING_MODERATE up. UI_HIDDEN (going to background) is
+        // deliberately EXCLUDED — flushing the HTTP cache there would undo
+        // the session cache that makes repeat AI Mode loads fast.
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE &&
+            level <= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+        ) {
             webView.clearCache(true)
             System.gc()
         }
