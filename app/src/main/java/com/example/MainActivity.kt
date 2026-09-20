@@ -1,6 +1,7 @@
 package com.example
 
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.ClipData
 import android.content.ComponentCallbacks2
@@ -322,6 +323,25 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         cookieManager.setAcceptThirdPartyCookies(webView, false)
 
         webView.addJavascriptInterface(BlobDownloadBridge(), "AndroidBlobBridge")
+
+        // v23: Gemini-style sites block their own download buttons (CSP /
+        // cross-frame blobs — the v22 chain reports "site blocked the
+        // download" there). But the image is already ON SCREEN with a plain
+        // URL: a long-press on any image now offers to save it directly —
+        // we fetch the bytes ourselves, outside the page's control.
+        webView.setOnLongClickListener {
+            val hit = webView.hitTestResult
+            val target = hit.extra
+            if ((hit.type == WebView.HitTestResult.IMAGE_TYPE ||
+                 hit.type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) &&
+                !target.isNullOrEmpty()
+            ) {
+                showSaveImageDialog(target)
+                true
+            } else {
+                false
+            }
+        }
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -998,6 +1018,73 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         } catch (e: Exception) {
             Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    // v23: "Save image" dialog for the long-press menu. Routes the image
+    // URL through the right saver: data: URIs, blob: URLs (in-page path)
+    // and everything else via our own direct downloader with cookies.
+    private fun showSaveImageDialog(imageUrl: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Save image")
+            .setMessage("Download this image to Downloads?")
+            .setPositiveButton("Download") { _, _ ->
+                when {
+                    imageUrl.startsWith("data:") -> saveRawBase64(imageUrl, "")
+                    imageUrl.startsWith("blob:") ->
+                        executeDownload(DownloadTask(imageUrl, if (isDesktopMode) desktopUserAgent else defaultUserAgent, "", ""))
+                    else -> downloadImageDirect(imageUrl)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // v23: direct image downloader — does NOT depend on the page at all, so
+    // no site policy can block it. Fetches with our UA + the page's cookies,
+    // sniffs the real type from the bytes, saves to Downloads and indexes it
+    // with Android's media library (so Google Photos shows it correctly).
+    private fun downloadImageDirect(url: String) {
+        Toast.makeText(this, "Downloading...", Toast.LENGTH_SHORT).show()
+        Thread {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 15_000
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", if (isDesktopMode) desktopUserAgent else defaultUserAgent)
+                    val cookies = CookieManager.getInstance().getCookie(url)
+                    if (!cookies.isNullOrEmpty()) setRequestProperty("Cookie", cookies)
+                    setRequestProperty("Referer", webView.url ?: url)
+                }
+                if (conn.responseCode !in 200..299) {
+                    throw RuntimeException("HTTP " + conn.responseCode)
+                }
+                val bytes = conn.inputStream.use { it.readBytes() }
+                val sniffed = sniffFileType(bytes)
+                val ext = sniffed.second.ifEmpty { ".jpg" }
+                val fileName = "Pulse_Image_${System.currentTimeMillis()}$ext"
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                downloadsDir.mkdirs()
+                val targetFile = File(downloadsDir, fileName)
+                targetFile.outputStream().use { it.write(bytes) }
+                MediaScannerConnection.scanFile(
+                    this,
+                    arrayOf(targetFile.absolutePath),
+                    arrayOf(sniffed.first.ifEmpty { "image/jpeg" }),
+                    null
+                )
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Saved to Downloads: $fileName", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }.start()
     }
 
     // ---- Desktop-mode site compatibility (responsive-site fix) ----
