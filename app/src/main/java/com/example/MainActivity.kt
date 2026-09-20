@@ -46,7 +46,14 @@ class MainActivity : AppCompatActivity() {
         webView = WebView(this)
         setContentView(webView)
 
-        lifecycle.addObserver(BrowserLifecycleObserver(webView))
+        // BrowserLifecycleObserver takes Application and onPurgeRequested callback
+        val lifecycleObserver = BrowserLifecycleObserver(
+            application = application,
+            onPurgeRequested = {
+                clearMemoryAndCookies()
+            }
+        )
+        lifecycle.addObserver(lifecycleObserver)
         webView.webChromeClient = CustomChromeClient()
 
         // Register bridge for chunked in-memory downloads
@@ -158,7 +165,7 @@ class MainActivity : AppCompatActivity() {
             dm.enqueue(request)
 
             Toast.makeText(this, "Download started: $fileName", Toast.LENGTH_SHORT).show()
-            clearSessionCookies()
+            clearMemoryAndCookies()
         } catch (e: Exception) {
             Toast.makeText(this, "Download failed: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
         }
@@ -167,7 +174,6 @@ class MainActivity : AppCompatActivity() {
     private fun streamBlobToDisk(blobUrl: String, mimeType: String, fileName: String) {
         val streamId = System.currentTimeMillis().toString()
 
-        // 64 KB slicing stream to eliminate RAM spikes during large media downloads
         val script = """
             (function() {
                 try {
@@ -206,7 +212,7 @@ class MainActivity : AppCompatActivity() {
                         AndroidBlobBridge.onStreamError('$streamId', error.message || error.toString());
                     });
                 } catch (err) {
-                    AndroidBlobBridge.onStreamError('$streamId', err.message || err.toString());
+                    AndroidBlobBridge.onStreamError('$streamId', err.message || error.toString());
                 }
             })();
         """.trimIndent()
@@ -216,7 +222,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun clearSessionCookies() {
+    private fun clearMemoryAndCookies() {
         val cookieManager = CookieManager.getInstance()
         cookieManager.removeSessionCookies {
             cookieManager.flush()
@@ -280,7 +286,7 @@ class MainActivity : AppCompatActivity() {
 
                 webView.post {
                     Toast.makeText(this@MainActivity, "Saved: $fileName", Toast.LENGTH_SHORT).show()
-                    clearSessionCookies()
+                    clearMemoryAndCookies()
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
