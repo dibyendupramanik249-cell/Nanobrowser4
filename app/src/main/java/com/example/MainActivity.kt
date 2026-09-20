@@ -293,7 +293,6 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
 
         s.offscreenPreRaster = false
         s.mediaPlaybackRequiresUserGesture = true
-
         // Session HTTP cache (user-approved): the cache lives on DISK, so the
         // RAM footprint is only a small in-memory index (well under 1 MB) —
         // the renderer, the trim-purge and the exit-wipe all stay unchanged.
@@ -689,8 +688,8 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     // session cache, a stalled in-page view transition, a Google flake), so
     // instead of guessing: RECOVER. 12s after a google.com/search page starts
     // (re-armed after it finishes), if the view has no scrollable content at
-    // all — a real results page ALWAYS scrolls — recover it. Max 2 attempts
-    // per URL, so it can never loop.
+    // all — a real results page ALWAYS scrolls — reload once with the HTTP
+    // cache bypassed. Max 2 attempts per URL, so it can never loop.
     private val blankCheckRunnable = object : Runnable {
         override fun run() {
             val url = webView.url ?: return
@@ -742,13 +741,17 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         } catch (_: Exception) {}
     }
 
-    // ---- Bounded session cache (v16) ----
+    // ---- Bounded session cache (v16, fixed v20) ----
     // The LOAD_DEFAULT session cache (v10) makes repeat AI Mode / site loads
     // fast, but it collects data on disk with no system-side size limit —
     // the user watched it grow in App Info. So: after each page load, measure
-    // our full on-disk footprint on a background thread; above 20 MB, flush
-    // the WebView cache. Cookies/login are untouched (clearCache only purges
-    // cached resources). The exit-wipe still erases everything on close.
+    // our full on-disk footprint on a background thread; above 20 MB, flush.
+    // v20 fix: clearCache() alone only purges the HTTP cache — the heavy
+    // stuff under app_webview (Service Worker CacheStorage, GPUCache,
+    // Code Cache) survived it, so the budget kept tripping while the
+    // footprint never shrank. The flush now also runs the same deep clean
+    // the exit-wipe uses. Cookies/login/history are untouched; the
+    // exit-wipe still erases everything on close.
     private fun checkCacheBudget() {
         if (cacheCheckBusy) return
         cacheCheckBusy = true
@@ -764,6 +767,16 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     runOnUiThread {
                         try { webView.clearCache(true) } catch (_: Exception) {}
                     }
+                    // v20: also deep-clean the heavy on-disk folders. We are
+                    // already on a background thread, so file deletion here
+                    // never blocks the UI. Cookies, logins and history are
+                    // not in these folders — they stay.
+                    try {
+                        cleanDir(cacheDir)
+                        cleanDir(codeCacheDir)
+                        externalCacheDir?.let { cleanDir(it) }
+                        cleanChromiumCache(webviewDir)
+                    } catch (_: Exception) {}
                 }
             } catch (_: Exception) {
             } finally {
@@ -948,7 +961,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             // charset tag) — decoding with the wrong charset would corrupt
             // every non-ASCII character in the page.
             val head = String(bytes.copyOfRange(0, minOf(2048, bytes.size)), charset("ISO-8859-1"))
-            val charsetName = Regex("charset\\s*=\\s*[\\\"']?\\s*([A-Za-z0-9_\\-]+)")
+            val charsetName = Regex("charset\\s*=\\s*[\\\"']?\\s*([A-Za-z0-9_\\\\-]+)")
                 .find(rawType + " " + head)?.groupValues?.get(1)
                 ?.takeIf { runCatching { Charset.isSupported(it) }.getOrDefault(false) } ?: "utf-8"
 
