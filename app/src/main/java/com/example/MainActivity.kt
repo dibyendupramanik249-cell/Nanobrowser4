@@ -75,6 +75,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     // --- Chunked blob download state (corrupted-download fix) ---
     private var blobOutputStream: FileOutputStream? = null
     private var blobTempFile: File? = null
+    // v21: chunk integrity + real file type (see handleBlobChunk / sniffFileType)
+    private var blobNextOffset = 0L
+    private var blobDetectedMime = ""
+    private var blobDetectedExt = ""
 
     data class DownloadTask(
         val url: String,
@@ -1005,6 +1009,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     // time) instead of holding the whole file in RAM as base64 + bytes.
     private fun handleBlobChunk(base64Chunk: String, mimeType: String, offset: Long, totalSize: Long) {
         try {
+            val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
             if (offset == 0L) {
                 closeBlobStream()
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -1018,8 +1023,30 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 val f = File(downloadsDir, "Flow_Video_${System.currentTimeMillis()}.part")
                 blobTempFile = f
                 blobOutputStream = f.outputStream()
+                // v21: sniff the REAL type from the first chunk's magic bytes.
+                // The page's blob.type is often empty or wrong — that gave
+                // .mp4 names to webm videos (unplayable everywhere) and
+                // indexed images with a wrong mime (hidden in Google Photos).
+                val sniffed = sniffFileType(bytes)
+                blobDetectedMime = sniffed.first
+                blobDetectedExt = sniffed.second
+                blobNextOffset = bytes.size.toLong()
+            } else {
+                // v21: chunk integrity. A dropped or misordered chunk used
+                // to append silently misaligned bytes — a full-size but
+                // CORRUPT file no player could open. Abort loudly instead.
+                if (blobOutputStream == null) return // download already finished/aborted
+                if (offset != blobNextOffset) {
+                    closeBlobStream()
+                    blobTempFile?.delete()
+                    blobTempFile = null
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Save failed: download interrupted", Toast.LENGTH_SHORT).show()
+                    }
+                    return
+                }
+                blobNextOffset += bytes.size
             }
-            val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
             blobOutputStream?.write(bytes)
         } catch (e: Exception) {
             closeBlobStream()
@@ -1028,6 +1055,24 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             runOnUiThread {
                 Toast.makeText(this@MainActivity, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    // v21: identify the real file type from magic bytes (independent of
+    // whatever mime the page claimed). Returns (mime, extension).
+    private fun sniffFileType(b: ByteArray): Pair<String, String> {
+        fun at(i: Int, c: Char) = i < b.size && b[i] == c.toByte()
+        return when {
+            b.size > 12 && b[0] == 0x1A.toByte() && b[1] == 0x45.toByte() &&
+                b[2] == 0xDF.toByte() && b[3] == 0xA3.toByte() -> "video/webm" to ".webm"
+            b.size > 12 && at(4, 'f') && at(5, 't') && at(6, 'y') && at(7, 'p') -> "video/mp4" to ".mp4"
+            b.size > 4 && b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte() -> "image/jpeg" to ".jpg"
+            b.size > 8 && b[0] == 0x89.toByte() && at(1, 'P') && at(2, 'N') && at(3, 'G') -> "image/png" to ".png"
+            b.size > 12 && at(0, 'R') && at(1, 'I') && at(2, 'F') && at(3, 'F') &&
+                at(8, 'W') && at(9, 'E') && at(10, 'B') && at(11, 'P') -> "image/webp" to ".webp"
+            b.size > 4 && at(0, 'G') && at(1, 'I') && at(2, 'F') -> "image/gif" to ".gif"
+            b.size > 4 && at(0, '%') && at(1, 'P') && at(2, 'D') -> "application/pdf" to ".pdf"
+            else -> "" to ""
         }
     }
 
@@ -1042,7 +1087,10 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                 }
                 return
             }
+            // v21: prefer the type sniffed from the actual bytes over the
+            // page-supplied mime (often empty or plain wrong).
             val ext = when {
+                blobDetectedExt.isNotEmpty() -> blobDetectedExt
                 mimeType.contains("video/webm") -> ".webm"
                 mimeType.contains("video/mp4") || mimeType.contains("video/quicktime") -> ".mp4"
                 mimeType.contains("image/png") -> ".png"
@@ -1062,7 +1110,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             MediaScannerConnection.scanFile(
                 this,
                 arrayOf(finalFile.absolutePath),
-                arrayOf(mimeType.ifEmpty { "video/mp4" }),
+                arrayOf(blobDetectedMime.ifEmpty { mimeType.ifEmpty { "application/octet-stream" } }),
                 null
             )
             runOnUiThread {
@@ -1074,6 +1122,9 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
             }
         } finally {
             blobTempFile = null
+            blobDetectedMime = ""
+            blobDetectedExt = ""
+            blobNextOffset = 0L
         }
     }
 
@@ -1091,7 +1142,9 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     val rawBase64 = dataUri.substring(commaIndex + 1)
                     val bytes = Base64.decode(rawBase64, Base64.DEFAULT)
 
+                    val sniffed = sniffFileType(bytes)
                     val extension = when {
+                        sniffed.second.isNotEmpty() -> sniffed.second
                         header.contains("video/mp4") || mimeTypeHint.contains("video/mp4") -> ".mp4"
                         header.contains("video/webm") || mimeTypeHint.contains("video/webm") -> ".webm"
                         header.contains("image/png") -> ".png"
@@ -1099,6 +1152,12 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                         header.contains("image/webp") -> ".webp"
                         header.contains("application/pdf") -> ".pdf"
                         else -> ".mp4"
+                    }
+                    // v21: scan with the CORRECT mime — the old code always
+                    // told Android "video/mp4", so images saved from data:
+                    // URLs never showed up in Google Photos.
+                    val scanMime = sniffed.first.ifEmpty {
+                        header.substringAfter("data:", "").substringBefore(';').ifEmpty { "application/octet-stream" }
                     }
 
                     val fileName = "Flow_Video_${System.currentTimeMillis()}$extension"
@@ -1111,7 +1170,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     MediaScannerConnection.scanFile(
                         this@MainActivity,
                         arrayOf(targetFile.absolutePath),
-                        arrayOf("video/mp4"),
+                        arrayOf(scanMime),
                         null
                     )
 
