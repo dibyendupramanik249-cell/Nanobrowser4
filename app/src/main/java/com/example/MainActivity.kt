@@ -46,17 +46,13 @@ class MainActivity : AppCompatActivity() {
         webView = WebView(this)
         setContentView(webView)
 
-        // BrowserLifecycleObserver takes Application and onPurgeRequested callback
-        val lifecycleObserver = BrowserLifecycleObserver(
-            application = application,
-            onPurgeRequested = {
-                clearMemoryAndCookies()
-            }
-        )
+        // Passed as positional arguments to avoid named-parameter compilation errors
+        val lifecycleObserver = BrowserLifecycleObserver(application) {
+            clearMemoryAndCookies()
+        }
         lifecycle.addObserver(lifecycleObserver)
         webView.webChromeClient = CustomChromeClient()
 
-        // Register bridge for chunked in-memory downloads
         webView.addJavascriptInterface(BlobInterface(), "AndroidBlobBridge")
 
         val settings: WebSettings = webView.settings
@@ -77,12 +73,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Standard site downloads
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
-            startDownload(url, userAgent, contentDisposition, mimetype)
+            if (url != null) {
+                startDownload(url, userAgent, contentDisposition, mimetype)
+            }
         }
 
-        // Tap-and-hold (Long press) image/media download handler
         webView.setOnLongClickListener {
             val result = webView.hitTestResult
             val type = result.type
@@ -99,7 +95,6 @@ class MainActivity : AppCompatActivity() {
             false
         }
 
-        // Handle hardware and gesture back button
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (webView.canGoBack()) {
@@ -173,6 +168,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun streamBlobToDisk(blobUrl: String, mimeType: String, fileName: String) {
         val streamId = System.currentTimeMillis().toString()
+        val safeFileName = fileName.replace("'", "\\'")
 
         val script = """
             (function() {
@@ -185,7 +181,7 @@ class MainActivity : AppCompatActivity() {
                     .then(async blob => {
                         const chunkSize = 64 * 1024;
                         const totalChunks = Math.ceil(blob.size / chunkSize);
-                        const suggestedName = '$fileName';
+                        const suggestedName = '$safeFileName';
                         const detectedMime = blob.type || '$mimeType';
 
                         AndroidBlobBridge.onStreamStart('$streamId', suggestedName, detectedMime);
@@ -212,7 +208,7 @@ class MainActivity : AppCompatActivity() {
                         AndroidBlobBridge.onStreamError('$streamId', error.message || error.toString());
                     });
                 } catch (err) {
-                    AndroidBlobBridge.onStreamError('$streamId', err.message || error.toString());
+                    AndroidBlobBridge.onStreamError('$streamId', err.message || err.toString());
                 }
             })();
         """.trimIndent()
@@ -224,9 +220,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun clearMemoryAndCookies() {
         val cookieManager = CookieManager.getInstance()
-        cookieManager.removeSessionCookies {
-            cookieManager.flush()
-        }
+        cookieManager.removeSessionCookies(null)
+        cookieManager.flush()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -247,7 +242,7 @@ class MainActivity : AppCompatActivity() {
                         put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                         put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                     }
-                    val resolver = contentResolver
+                    val resolver = this@MainActivity.contentResolver
                     val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
                     val os = uri?.let { resolver.openOutputStream(it) }
 
