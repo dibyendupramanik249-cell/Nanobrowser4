@@ -163,6 +163,16 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         fun finishBlob(mimeType: String, totalSize: Long) {
             finishBlobDownload(mimeType, totalSize)
         }
+
+        // v22: the old blob JS failed SILENTLY (only console.error) — the
+        // user saw "Downloading..." but no file ever appeared. Now the page
+        // reports the real reason, and we show it.
+        @JavascriptInterface
+        fun blobFailed(message: String) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Save failed: $message", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -364,6 +374,27 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                         if (target == "about:blank" || target.startsWith("data:")) {
                             return false
                         }
+                        // v22: some sites (e.g. gemini.google.com) trigger
+                        // downloads as window.open("blob:...") popups — the
+                        // old capture code swallowed those silently (no file,
+                        // no error). Forward them to the main view's download
+                        // pipeline: the blob is same-origin in the main page,
+                        // so the injected fetch can read it.
+                        if (!captured && target.startsWith("blob:")) {
+                            captured = true
+                            val dlTask = DownloadTask(
+                                target,
+                                if (isDesktopMode) desktopUserAgent else defaultUserAgent,
+                                "",
+                                ""
+                            )
+                            view.post { executeDownload(dlTask) }
+                            v?.post {
+                                try { v.destroy() } catch (_: Exception) {}
+                                if (popupCaptureWebView === v) popupCaptureWebView = null
+                            }
+                            return true
+                        }
                         if (!captured && (target.startsWith("http://") || target.startsWith("https://"))) {
                             captured = true
                             view.loadUrl(normalizeAiModeUrl(target))
@@ -379,6 +410,20 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                     // shouldOverrideUrlLoading on some WebView builds.
                     override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
                         super.onPageStarted(v, url, favicon)
+                        if (!captured && url != null && url.startsWith("blob:")) {
+                            captured = true
+                            val dlTask = DownloadTask(
+                                url,
+                                if (isDesktopMode) desktopUserAgent else defaultUserAgent,
+                                "",
+                                ""
+                            )
+                            view.post { executeDownload(dlTask) }
+                            v?.post {
+                                try { v.destroy() } catch (_: Exception) {}
+                                if (popupCaptureWebView === v) popupCaptureWebView = null
+                            }
+                        }
                         if (!captured && url != null &&
                             (url.startsWith("http://") || url.startsWith("https://"))
                         ) {
@@ -842,11 +887,16 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
         // large files (JS→Java bridge string-size limit).
         if (url.startsWith("blob:")) {
             Toast.makeText(this, "Downloading...", Toast.LENGTH_SHORT).show()
+            // v22: three-stage retrieval. fetch() is blocked by the page's
+            // own security policy (CSP) on some sites — e.g. gemini.google.com
+            // — where the OLD code failed silently: the toast said
+            // "Downloading..." but no chunk ever arrived, so no file appeared.
+            // Chain: fetch -> XHR -> <img>+canvas (images); a real failure is
+            // reported back to Java so the user finally SEES the reason.
             val js = """
                 (function() {
-                    fetch('$url')
-                    .then(function(response) { return response.blob(); })
-                    .then(function(blob) {
+                    var BR = window.AndroidBlobBridge;
+                    function streamBlob(blob) {
                         var CHUNK = 262144;
                         var mime = blob.type;
                         var size = blob.size;
@@ -858,20 +908,54 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
                                 if (reader.readyState === FileReader.DONE) {
                                     var s = reader.result;
                                     var b64 = s.substring(s.indexOf(',') + 1);
-                                    window.AndroidBlobBridge.processBlobChunk(b64, mime, offset, size);
+                                    BR.processBlobChunk(b64, mime, offset, size);
                                     offset += CHUNK;
                                     if (offset < size) {
                                         setTimeout(next, 0);
                                     } else {
-                                        window.AndroidBlobBridge.finishBlob(mime, size);
+                                        BR.finishBlob(mime, size);
                                     }
                                 }
                             };
                             reader.readAsDataURL(slice);
                         }
-                        if (size > 0) { next(); } else { window.AndroidBlobBridge.finishBlob(mime, 0); }
-                    })
-                    .catch(function(err) { console.error(err); });
+                        if (size > 0) { next(); } else { BR.finishBlob(mime, 0); }
+                    }
+                    function fail(msg) { BR.blobFailed(String(msg)); }
+                    function tryCanvas() {
+                        var img = new Image();
+                        img.onload = function() {
+                            try {
+                                var c = document.createElement('canvas');
+                                c.width = img.naturalWidth;
+                                c.height = img.naturalHeight;
+                                c.getContext('2d').drawImage(img, 0, 0);
+                                c.toBlob(function(b) {
+                                    if (b) { streamBlob(b); } else { fail('image re-encode failed'); }
+                                }, 'image/png');
+                            } catch (e) { fail(e); }
+                        };
+                        img.onerror = function() { fail('site blocked the download'); };
+                        img.src = '$url';
+                    }
+                    function tryXhr() {
+                        try {
+                            var xhr = new XMLHttpRequest();
+                            xhr.open('GET', '$url');
+                            xhr.responseType = 'blob';
+                            xhr.onload = function() {
+                                if (xhr.response) { streamBlob(xhr.response); } else { tryCanvas(); }
+                            };
+                            xhr.onerror = function() { tryCanvas(); };
+                            xhr.send();
+                        } catch (e) { tryCanvas(); }
+                    }
+                    try {
+                        fetch('$url')
+                        .then(function(r) { return r.blob(); })
+                        .then(streamBlob)
+                        .catch(tryXhr);
+                    } catch (e) { tryXhr(); }
                 })();
             """.trimIndent()
             webView.evaluateJavascript(js, null)
