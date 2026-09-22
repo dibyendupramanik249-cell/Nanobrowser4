@@ -1,30 +1,49 @@
 package com.example.engine
 
-import android.webkit.GeolocationPermissions
-import android.webkit.PermissionRequest
-import android.webkit.WebChromeClient
-import android.webkit.WebView
+import android.app.Application
+import android.os.Process
 import android.util.Log
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.File
 
-class CustomChromeClient(
-    private val onProgressChangedAction: ((Int) -> Unit)? = null
-) : WebChromeClient() {
+class BrowserLifecycleObserver(
+    private val app: Application,
+    private val onPurgeRequested: () -> Unit
+) : DefaultLifecycleObserver {
 
-    override fun onProgressChanged(view: WebView?, newProgress: Int) {
-        super.onProgressChanged(view, newProgress)
-        onProgressChangedAction?.invoke(newProgress)
+    private val scope = CoroutineScope(Dispatchers.Main)
+    private var reaperJob: Job? = null
+
+    override fun onStart(owner: LifecycleOwner) {
+        super.onStart(owner)
+        reaperJob?.cancel()
     }
 
-    override fun onPermissionRequest(request: PermissionRequest?) {
-        Log.d("CustomChromeClient", "Permission denied automatically: ${request?.resources?.joinToString()}")
-        request?.deny()
+    override fun onStop(owner: LifecycleOwner) {
+        super.onStop(owner)
+        reaperJob = scope.launch {
+            delay(120_000L) // 2 minutes in background, then wipe and exit
+            onPurgeRequested()
+            deleteRecursively(app.cacheDir)
+            deleteRecursively(app.codeCacheDir)
+            Process.killProcess(Process.myPid())
+        }
     }
 
-    override fun onGeolocationPermissionsShowPrompt(
-        origin: String?,
-        callback: GeolocationPermissions.Callback?
-    ) {
-        Log.d("CustomChromeClient", "Geolocation denied automatically for origin: $origin")
-        callback?.invoke(origin, false, false)
+    private fun deleteRecursively(fileOrDirectory: File?) {
+        if (fileOrDirectory != null && fileOrDirectory.exists()) {
+            if (fileOrDirectory.isDirectory) {
+                fileOrDirectory.listFiles()?.forEach { child ->
+                    deleteRecursively(child)
+                }
+            }
+            fileOrDirectory.delete()
+        }
     }
 }
