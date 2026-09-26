@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity(), ComponentCallbacks2 {
     // Feedback-Backend.gs). After deploying it, replace the placeholder
     // with your /exec URL and rebuild. Zero RAM cost: the button just
     // opens a webpage in the browser itself, user-initiated only.
-    private val feedbackUrl = "PASTE_YOUR_APPS_SCRIPT_URL_HERE"
+    private val feedbackUrl = "https://pulsehorizon.pythonanywhere.com"
 
     private var chromeHidden = false
     private var lastStripTap = 0L
