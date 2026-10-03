@@ -1,0 +1,1 @@
+First release: ultra-lightweight privacy browser with exit wipe, ad/tracker blocking, bounded cache, universal downloads, immersive full-screen mode and a built-in feedback form.
