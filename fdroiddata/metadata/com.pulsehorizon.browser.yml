@@ -30,7 +30,7 @@ Repo: https://github.com/dibyendupramanik249-cell/Pulse-Horizon.git
 Builds:
   - versionName: '6.0'
     versionCode: 6
-    commit: aeb4aceb81b038e33bf33f51dbf8fe77c75a9389
+    commit: b870e41f29c355fb46d6e2e4123f2fd8274fa73d
     subdir: app
     gradle:
       - yes
