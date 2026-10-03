@@ -1,0 +1,12 @@
+Pulse Horizon is an ultra-lightweight Android privacy browser built on the system WebView. Everything you leave behind - history, cookies and cache - is erased when you close the browser, and third-party cookies are blocked by default.
+
+It keeps its cache bounded at about 20 MB and cleans it while you browse, so the app stays small and fast. There are no background services, no timers and no notifications: zero battery use after you exit.
+
+Features:
+* Exit wipe: history, cookies and cache erased on close
+* Blocks third-party cookies and known ad/tracker servers
+* Bounded ~20 MB cache that cleans itself while browsing
+* Universal download engine: files save with correct names and real types
+* Immersive full screen with a double-tap URL bar
+* Desktop mode and pinch-to-zoom
+* No analytics, no ads, no Google Play Services
