@@ -1,0 +1,40 @@
+Categories:
+  - Internet
+  - Security
+License: GPL-3.0-or-later
+AuthorName: Dibyendu Pramanik
+AuthorEmail: dibyendupramanik249@gmail.com
+SourceCode: https://github.com/dibyendupramanik249-cell/Pulse-Horizon
+IssueTracker: https://github.com/dibyendupramanik249-cell/Pulse-Horizon/issues
+AutoName: Pulse Horizon
+Summary: Ultra-lightweight privacy browser that wipes its data on exit
+Description: |-
+  Pulse Horizon is an ultra-lightweight Android privacy browser built on the
+  system WebView. Everything you leave behind - history, cookies and cache - is
+  erased when you close the browser, and third-party cookies are blocked by
+  default.
+
+  It keeps its cache bounded at about 20 MB and cleans it while you browse, so
+  the app stays small and fast. There are no background services, no timers and
+  no notifications: zero battery use after you exit.
+
+  Features include a universal download engine that saves files with correct
+  names and real types, immersive full-screen browsing with a double-tap URL
+  bar, desktop mode, pinch-to-zoom, network-level ad and tracker blocking, and
+  a built-in feedback form that sends messages directly to the developer.
+
+  No analytics, no advertising SDKs, no crash reporting. The browser sends
+  nothing anywhere by itself.
+RepoType: git
+Repo: https://github.com/dibyendupramanik249-cell/Pulse-Horizon.git
+Builds:
+  - versionName: '6.0'
+    versionCode: 6
+    commit: b870e41f29c355fb46d6e2e4123f2fd8274fa73d
+    subdir: app
+    gradle:
+      - yes
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: '6.0'
+CurrentVersionCode: 6
